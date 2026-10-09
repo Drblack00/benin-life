@@ -37,7 +37,7 @@
     <div class="hud-right">
       <button id="btn-recenter" class="icon-btn hidden" title="Follow me">📍</button>
       <button id="btn-dm" class="icon-btn" title="Messages">✉️<span id="dm-badge" class="badge hidden"></span></button>
-      <button id="btn-menu" class="icon-btn" title="Menu">☰</button>
+      <button id="btn-nearby" class="icon-btn" title="Nearby">🔭</button>
       <button id="btn-admin" class="icon-btn hidden" title="Admin panel">🛠</button>
       <button id="btn-help" class="icon-btn" title="Help">❓</button>
       <button id="btn-logout" class="icon-btn" title="Log out">⏻</button>
@@ -56,6 +56,11 @@
       <canvas id="map" class="hidden"></canvas>
       <div id="bubble-layer"></div>
       <div id="map-fallback-note" class="hidden">🗺️ Stylized map — the real Google map unlocks soon</div>
+      <button id="menu-fab" title="Menu">☰</button>
+      <div id="nearby-panel" class="hidden">
+        <div class="np-head"><b>🔭 Nearby</b><button id="nearby-close">✕</button></div>
+        <div id="nearby-list"></div>
+      </div>
     </div>
 
     <div id="chat-panel">
@@ -118,6 +123,7 @@
       <div class="zone-title">❓ How to play <button id="help-close" class="icon-btn">✕</button></div>
       <div class="help-body">
         <p><b>Move:</b> tap anywhere on the map to walk there, or use WASD / arrows / the D-pad. Drag to look around, pinch (or scroll) to zoom. This is the real Benin City — Ring Road, Oba Market, UNIBEN and more.</p>
+        <p><b>🔭 Nearby:</b> street finds (💵 cash, 🍲 snacks, 🥤 drinks) pop up around you — walk into the teal circle and tap them to grab them. The Nearby tracker shows what's close and which way to go.</p>
         <p><b>Chat:</b> type below — every real player in the city sees it.</p>
         <p><b>Hustle:</b> walk into a marked zone to find work, food and vibes.</p>
         <p><b>Survive:</b> eat when hungry, sleep to restore energy, keep your vibe up at Ogba Zoo or Kada Plaza.</p>

@@ -14,6 +14,8 @@ let ws = null, token = localStorage.getItem('bl_token') || null;
 let myName = localStorage.getItem('bl_name') || null;
 let me = null;
 const players = new Map(); // id -> {id,name,lat,lng,tlat,tlng,housing,gov}
+const spawns = new Map(); // id -> {id,lat,lng,kind,icon,amount,expires}
+const effects = []; // collect sparkles {lat,lng,t0}
 let ZONES = {}, JOBS = {}, FOOD = {}, FUN = {}, HOUSING = {}, BOUNDS = null;
 let BIZT = {}, VEHT = {};
 let myBiz = null, election = { active: false }, governor = null, unreadDm = 0;
@@ -113,6 +115,8 @@ async function handle(m) {
       speedMult = m.you.speedMult || 1;
       players.clear();
       for (const p of m.players) players.set(p.id, { ...p, tlat: p.lat, tlng: p.lng });
+      spawns.clear();
+      for (const s of (m.spawns || [])) spawns.set(s.id, s);
       $('auth-screen').classList.add('hidden');
       $('game-screen').classList.remove('hidden');
       if (me.is_admin) $('btn-admin').classList.remove('hidden');
@@ -123,6 +127,12 @@ async function handle(m) {
       updateDmBadge();
       await initRenderer();
       updateHUD(); startLoop();
+      break;
+    case 'spawn':
+      spawns.set(m.s.id, m.s);
+      break;
+    case 'despawn':
+      spawns.delete(m.id);
       break;
     case 'join': {
       const p = { ...m.p, tlat: m.p.lat, tlng: m.p.lng };
@@ -525,11 +535,11 @@ class CanvasRenderer {
         if (this.parks.some(p => Math.hypot(x - p.x, y - p.y) < p.r + 70)) continue;
         if (Object.values(ZM).some(z => Math.hypot(x - z.x, y - z.y) < z.r + 130)) continue;
         const w = 45 + rnd() * 70, h = 45 + rnd() * 70;
-        const sh = 22 + rnd() * 16;
+        const sh = 222 + rnd() * 20;
         const warm = rnd() < 0.18;
         this.buildings.push({
           x: x - w / 2, y: y - h / 2, w, h,
-          c: warm ? `rgb(${sh + 14},${sh + 4},${sh - 2})` : `rgb(${sh},${sh + 7},${sh + 14})`,
+          c: warm ? `rgb(${sh},${sh - 10},${sh - 26})` : `rgb(${sh - 8},${sh - 2},${sh - 6})`,
         });
       }
     }
@@ -585,6 +595,16 @@ class CanvasRenderer {
   handleTap(e) {
     const r = this.canvas.getBoundingClientRect();
     const x = e.clientX - r.left, y = e.clientY - r.top;
+    // street finds first (GO-style tap interaction)
+    for (const sp of spawns.values()) {
+      const m = this.ll2m(sp.lat, sp.lng);
+      const s = this.w2s(m.x, m.y, r.width, r.height);
+      if (Math.hypot(s.x - x, s.y - y) < 32) {
+        if (ws && ws.readyState === 1) ws.send(JSON.stringify({ t: 'collect', id: sp.id }));
+        effects.push({ lat: sp.lat, lng: sp.lng, t0: performance.now() });
+        return;
+      }
+    }
     for (const p of players.values()) {
       const m = this.ll2m(p.lat, p.lng);
       const s = this.w2s(m.x, m.y, r.width, r.height);
@@ -624,6 +644,7 @@ class CanvasRenderer {
     const pad = 9, ph = 24;
     this.rr(x - tw / 2 - pad, y - ph / 2, tw + pad * 2, ph, 12);
     ctx.fillStyle = bg; ctx.fill();
+    ctx.strokeStyle = 'rgba(30,50,70,0.14)'; ctx.lineWidth = 1; ctx.stroke();
     ctx.fillStyle = fg; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillText(text, x, y + 1);
     ctx.textBaseline = 'alphabetic';
@@ -638,107 +659,159 @@ class CanvasRenderer {
     }
     const z = this.cam.z;
     const S = (x, y) => this.w2s(x, y, w, h);
-    // background
+    const t = performance.now() / 1000;
+    // === bright GO-style land ===
     const g = ctx.createLinearGradient(0, 0, 0, h);
-    g.addColorStop(0, '#0d1622'); g.addColorStop(1, '#090f17');
+    g.addColorStop(0, '#b9dcc9'); g.addColorStop(1, '#a2cbb6');
     ctx.fillStyle = g; ctx.fillRect(0, 0, w, h);
     const x0 = this.cam.x - w / 2 / z, x1 = this.cam.x + w / 2 / z;
     const y0 = this.cam.y - h / 2 / z, y1 = this.cam.y + h / 2 / z;
     const vis = (x, y, m) => x > x0 - m && x < x1 + m && y > y0 - m && y < y1 + m;
-    // river
     ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-    ctx.strokeStyle = '#0d2839'; ctx.lineWidth = 300 * z;
+    // river — bright blue
+    ctx.strokeStyle = '#57a8d8'; ctx.lineWidth = 300 * z;
     ctx.beginPath();
     this.river.forEach(([x, y], i) => { const s = S(x, y); i ? ctx.lineTo(s.x, s.y) : ctx.moveTo(s.x, s.y); });
     ctx.stroke();
-    ctx.strokeStyle = '#123449'; ctx.lineWidth = 230 * z;
+    ctx.strokeStyle = '#7fc4e9'; ctx.lineWidth = 215 * z;
     ctx.stroke();
-    // parks
+    // parks — vivid green
     for (const p of this.parks) {
       if (!vis(p.x, p.y, p.r)) continue;
       const s = S(p.x, p.y);
-      ctx.fillStyle = '#122b1a';
+      ctx.fillStyle = '#7fc47c';
       ctx.beginPath(); ctx.arc(s.x, s.y, p.r * z, 0, Math.PI * 2); ctx.fill();
-      ctx.fillStyle = '#163722';
-      ctx.beginPath(); ctx.arc(s.x, s.y, p.r * 0.72 * z, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#a3d9a0';
+      ctx.beginPath(); ctx.arc(s.x, s.y, p.r * 0.7 * z, 0, Math.PI * 2); ctx.fill();
     }
-    // buildings
+    // buildings — light blocks
     for (const b of this.buildings) {
       if (b.x > x1 || b.x + b.w < x0 || b.y > y1 || b.y + b.h < y0) continue;
       const s = S(b.x, b.y);
       ctx.fillStyle = b.c;
       ctx.fillRect(s.x, s.y, Math.max(1.5, b.w * z), Math.max(1.5, b.h * z));
     }
-    // roads
+    // roads — white with soft casing
     for (const rd of this.roads) {
-      ctx.strokeStyle = rd.c; ctx.lineWidth = Math.max(2, rd.w * z);
-      ctx.beginPath();
-      rd.pts.forEach(([x, y], i) => { const s = S(x, y); i ? ctx.lineTo(s.x, s.y) : ctx.moveTo(s.x, s.y); });
-      ctx.stroke();
-      if (rd.dash && z > 0.008) {
-        ctx.strokeStyle = 'rgba(214,178,74,0.5)'; ctx.lineWidth = Math.max(1, 3 * z * 10);
-        ctx.setLineDash([16 * z * 10, 22 * z * 10]);
-        ctx.stroke();
-        ctx.setLineDash([]);
-      }
+      const ww = Math.max(3, rd.w * z);
+      const path = () => {
+        ctx.beginPath();
+        rd.pts.forEach(([x, y], i) => { const s = S(x, y); i ? ctx.lineTo(s.x, s.y) : ctx.moveTo(s.x, s.y); });
+      };
+      ctx.strokeStyle = '#d5dcd6'; ctx.lineWidth = ww + 3;
+      path(); ctx.stroke();
+      ctx.strokeStyle = '#ffffff'; ctx.lineWidth = ww;
+      path(); ctx.stroke();
     }
-    // zones
-    const t = performance.now() / 1000;
+    // === zone stops (GO-stop style badges) ===
     for (const [k, zv] of Object.entries(ZONES)) {
       const zm = this.ZM[k];
       if (!vis(zm.x, zm.y, zv.r)) continue;
-      const s = S(zm.x, zm.y), rad = zv.r * z;
-      const glow = ctx.createRadialGradient(s.x, s.y, rad * 0.2, s.x, s.y, rad);
-      glow.addColorStop(0, zv.color + 'aa'); glow.addColorStop(1, zv.color + '11');
-      ctx.fillStyle = glow;
-      ctx.beginPath(); ctx.arc(s.x, s.y, rad, 0, Math.PI * 2); ctx.fill();
-      ctx.strokeStyle = zv.color; ctx.lineWidth = 2;
-      ctx.setLineDash([10, 8]); ctx.lineDashOffset = -t * 12;
-      ctx.beginPath(); ctx.arc(s.x, s.y, rad, 0, Math.PI * 2); ctx.stroke();
-      ctx.setLineDash([]);
-      const fs = Math.max(15, Math.min(26, 20 * Math.sqrt(z / (this._bz || z))));
-      ctx.font = `${fs}px sans-serif`; ctx.textAlign = 'center';
-      ctx.fillText(zv.icon, s.x, s.y - 4);
+      const s = S(zm.x, zm.y);
+      const inRange = meZone === k;
+      const R = Math.max(19, Math.min(30, 25 * Math.sqrt(z / (this._bz || z))));
+      ctx.save();
+      if (!inRange) ctx.globalAlpha = 0.6;
+      if (inRange) {
+        const pulse = 1 + Math.sin(t * 4) * 0.07;
+        ctx.fillStyle = 'rgba(47,128,237,0.22)';
+        ctx.beginPath(); ctx.arc(s.x, s.y, R * 1.6 * pulse, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.fillStyle = 'rgba(30,50,70,0.18)';
+      ctx.beginPath(); ctx.arc(s.x + 2, s.y + 4, R + 5, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath(); ctx.arc(s.x, s.y, R + 5, 0, Math.PI * 2); ctx.fill();
+      const disc = ctx.createRadialGradient(s.x - R * 0.3, s.y - R * 0.3, R * 0.2, s.x, s.y, R);
+      disc.addColorStop(0, inRange ? '#55a0f6' : '#6a9bd8');
+      disc.addColorStop(1, inRange ? '#1f6fe0' : '#4a76b8');
+      ctx.fillStyle = disc;
+      ctx.beginPath(); ctx.arc(s.x, s.y, R, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+      ctx.font = `${Math.round(R * 1.05)}px sans-serif`;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(zv.icon, s.x, s.y + 1);
+      ctx.textBaseline = 'alphabetic';
       if (z > (this._bz || z) * 0.55)
-        this.pill(s.x, s.y + 22, zv.name, '700 12px sans-serif', '#eef4fa', 'rgba(10,15,22,0.85)');
+        this.pill(s.x, s.y + R + 20, zv.name, '700 12px sans-serif', '#1c2b3a', '#ffffff');
+    }
+    // === street-find spawns ===
+    for (const sp of spawns.values()) {
+      const m = this.ll2m(sp.lat, sp.lng);
+      if (!vis(m.x, m.y, 200)) continue;
+      const s = S(m.x, m.y);
+      const bob = Math.sin(t * 3 + sp.id * 1.7) * 5;
+      const d = me ? haversineM(me.lat, me.lng, sp.lat, sp.lng) : 9999;
+      ctx.fillStyle = 'rgba(30,50,70,0.20)';
+      ctx.beginPath(); ctx.ellipse(s.x, s.y + 15, 12, 5, 0, 0, Math.PI * 2); ctx.fill();
+      if (d <= 300) {
+        ctx.strokeStyle = 'rgba(20,184,166,0.85)'; ctx.lineWidth = 2.5;
+        ctx.beginPath(); ctx.arc(s.x, s.y + bob, 21, 0, Math.PI * 2); ctx.stroke();
+      }
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath(); ctx.arc(s.x, s.y + bob, 16, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = '#dbe3ea'; ctx.lineWidth = 2; ctx.stroke();
+      ctx.font = '20px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(sp.icon, s.x, s.y + bob + 1);
+      ctx.textBaseline = 'alphabetic';
+    }
+    // === collect sparkles ===
+    for (let i = effects.length - 1; i >= 0; i--) {
+      const e = effects[i];
+      const age = (performance.now() - e.t0) / 650;
+      if (age >= 1) { effects.splice(i, 1); continue; }
+      const m = this.ll2m(e.lat, e.lng), s = S(m.x, m.y);
+      ctx.strokeStyle = `rgba(255,200,60,${1 - age})`; ctx.lineWidth = 3;
+      for (let k = 0; k < 8; k++) {
+        const a = (k / 8) * Math.PI * 2 + age;
+        const r1 = 8 + age * 26, r2 = r1 + 8;
+        ctx.beginPath();
+        ctx.moveTo(s.x + Math.cos(a) * r1, s.y + Math.sin(a) * r1);
+        ctx.lineTo(s.x + Math.cos(a) * r2, s.y + Math.sin(a) * r2);
+        ctx.stroke();
+      }
     }
     // route to destination
     if (me && clickTarget) {
       const a = this.ll2m(me.lat, me.lng), b = this.ll2m(clickTarget.lat, clickTarget.lng);
       const sa = S(a.x, a.y), sb = S(b.x, b.y);
-      ctx.strokeStyle = 'rgba(34,197,94,0.75)'; ctx.lineWidth = 3;
+      ctx.strokeStyle = 'rgba(20,184,166,0.8)'; ctx.lineWidth = 3;
       ctx.setLineDash([8, 8]); ctx.lineDashOffset = -t * 30;
       ctx.beginPath(); ctx.moveTo(sa.x, sa.y); ctx.lineTo(sb.x, sb.y); ctx.stroke();
       ctx.setLineDash([]);
       const pulse = 1 + Math.sin(t * 5) * 0.15;
-      ctx.font = `${20 * pulse}px sans-serif`; ctx.textAlign = 'center';
+      ctx.font = `${Math.round(20 * pulse)}px sans-serif`; ctx.textAlign = 'center';
       ctx.fillText('🚩', sb.x, sb.y - 8);
     }
-    // players
-    const dot = (lat, lng, color, label, isMe, gov, detained) => {
+    // === player (GO-style pin on pulsing disc) ===
+    const pin = (lat, lng, label, labelColor, isMe, gov) => {
       const m = this.ll2m(lat, lng), p = S(m.x, m.y);
       if (isMe) {
-        const pr = (14 + ((t * 22) % 26));
-        ctx.strokeStyle = `rgba(34,197,94,${Math.max(0, 0.5 - pr / 60)})`;
-        ctx.lineWidth = 2.5;
+        ctx.strokeStyle = 'rgba(20,184,166,0.35)'; ctx.lineWidth = 2;
+        ctx.setLineDash([10, 10]);
+        ctx.beginPath(); ctx.arc(p.x, p.y, 300 * z, 0, Math.PI * 2); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = 'rgba(20,184,166,0.20)';
+        ctx.beginPath(); ctx.arc(p.x, p.y, 24, 0, Math.PI * 2); ctx.fill();
+        const pr = 26 + ((t * 30) % 36);
+        ctx.strokeStyle = `rgba(20,184,166,${Math.max(0, 0.55 - pr / 75)})`;
+        ctx.lineWidth = 3;
         ctx.beginPath(); ctx.arc(p.x, p.y, pr, 0, Math.PI * 2); ctx.stroke();
       }
-      ctx.beginPath(); ctx.arc(p.x, p.y, isMe ? 11 : 9, 0, Math.PI * 2);
-      ctx.fillStyle = color;
-      ctx.shadowColor = color; ctx.shadowBlur = 12;
-      ctx.fill();
-      ctx.shadowBlur = 0;
-      if (isMe) { ctx.strokeStyle = '#fff'; ctx.lineWidth = 2.5; ctx.stroke(); }
-      this.pill(p.x, p.y - 24, label, '600 11px sans-serif', isMe ? '#22c55e' : '#eef4fa', 'rgba(10,15,22,0.8)');
-      if (gov) { ctx.font = '15px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('👑', p.x, p.y - 44); }
-      if (detained) { ctx.font = '15px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('⛓️', p.x + 16, p.y - 40); }
+      ctx.fillStyle = 'rgba(30,50,70,0.25)';
+      ctx.beginPath(); ctx.ellipse(p.x, p.y + 15, 12, 5, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath(); ctx.arc(p.x, p.y, isMe ? 14 : 11, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = isMe ? '#14b8a6' : '#94a3b8'; ctx.lineWidth = isMe ? 3.5 : 2.5;
+      ctx.stroke();
+      ctx.fillStyle = labelColor; ctx.font = `700 ${isMe ? 14 : 12}px sans-serif`;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(label.charAt(0).toUpperCase(), p.x, p.y + 1);
+      ctx.textBaseline = 'alphabetic';
+      this.pill(p.x, p.y - (isMe ? 30 : 26), label, '700 11px sans-serif', isMe ? '#0f766e' : '#334155', '#ffffff');
+      if (gov) { ctx.font = '16px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('👑', p.x, p.y - 48); }
     };
-    for (const p of players.values()) dot(p.lat, p.lng, colorFor(p.id), p.name, false, p.gov, false);
-    if (me) dot(me.lat, me.lng, colorFor(me.id), me.name, true, me.gov, false);
-    // vignette
-    const v = ctx.createRadialGradient(w / 2, h / 2, Math.min(w, h) * 0.42, w / 2, h / 2, Math.max(w, h) * 0.75);
-    v.addColorStop(0, 'rgba(0,0,0,0)'); v.addColorStop(1, 'rgba(0,0,0,0.42)');
-    ctx.fillStyle = v; ctx.fillRect(0, 0, w, h);
+    for (const p of players.values()) pin(p.lat, p.lng, p.name, '#334155', false, p.gov);
+    if (me) pin(me.lat, me.lng, me.name, '#0f766e', true, me.gov);
   }
   project(lat, lng) {
     const r = this.canvas.getBoundingClientRect();
@@ -1021,7 +1094,51 @@ const MENU_ITEMS = [
   ['runs', '🏃', 'Street Runs'],
 ];
 function esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
-$('btn-menu').onclick = () => openMenu(null);
+$('menu-fab').onclick = () => openMenu(null);
+$('btn-nearby').onclick = () => {
+  const p = $('nearby-panel');
+  p.classList.toggle('hidden');
+  if (!p.classList.contains('hidden')) updateNearby();
+};
+$('nearby-close').onclick = () => $('nearby-panel').classList.add('hidden');
+
+function fmtDist(d) { return d < 1000 ? `${Math.round(d)}m` : `${(d / 1000).toFixed(1)}km`; }
+function arrowTo(a, b) {
+  const dLat = b.lat - a.lat, dLng = (b.lng - a.lng) * Math.cos(a.lat * Math.PI / 180);
+  const brg = (Math.atan2(dLng, dLat) * 180 / Math.PI + 360) % 360;
+  return ['⬆️', '↗️', '➡️', '↘️', '⬇️', '↙️', '⬅️', '↖️'][Math.round(brg / 45) % 8];
+}
+function updateNearby() {
+  if (!me || $('nearby-panel').classList.contains('hidden')) return;
+  const items = [];
+  for (const sp of spawns.values()) {
+    const d = haversineM(me.lat, me.lng, sp.lat, sp.lng);
+    if (d < 1500) items.push({
+      icon: sp.icon, d, lat: sp.lat, lng: sp.lng,
+      name: sp.kind === 'cash' ? `₦${sp.amount.toLocaleString()}` : sp.kind === 'snack' ? 'Snack' : 'Energy drink',
+    });
+  }
+  for (const z of Object.values(ZONES)) {
+    const d = haversineM(me.lat, me.lng, z.lat, z.lng);
+    if (d < 3000) items.push({ icon: z.icon, name: z.name, d, lat: z.lat, lng: z.lng });
+  }
+  items.sort((a, b) => a.d - b.d);
+  const list = $('nearby-list');
+  list.innerHTML = '';
+  if (!items.length) { list.innerHTML = '<div class="np-empty">Nothing nearby — keep walking! 🚶</div>'; return; }
+  for (const it of items.slice(0, 9)) {
+    const div = document.createElement('div');
+    div.className = 'np-item';
+    const ic = document.createElement('span'); ic.className = 'np-icon'; ic.textContent = it.icon;
+    const nm = document.createElement('span'); nm.className = 'np-name'; nm.textContent = it.name;
+    const ar = document.createElement('span'); ar.textContent = arrowTo(me, it);
+    const ds = document.createElement('span'); ds.className = 'np-dist'; ds.textContent = fmtDist(it.d);
+    div.append(ic, nm, ar, ds);
+    div.onclick = () => { clickTarget = { lat: it.lat, lng: it.lng }; toast(`🚶 Heading to ${it.name}`); };
+    list.appendChild(div);
+  }
+}
+setInterval(updateNearby, 3000);
 $('menu-close').onclick = () => { $('menu-panel').classList.add('hidden'); menuTab = null; };
 
 function openMenu(tab) {
