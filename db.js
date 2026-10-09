@@ -566,7 +566,7 @@ export async function listFriendships(playerId) {
     `SELECT f.id, f.requester_id, f.addressee_id, f.status, f.created_ts, p.username AS other_username
      FROM friendships f JOIN players p
        ON p.id = CASE WHEN f.requester_id=$1 THEN f.addressee_id ELSE f.requester_id END
-     WHERE (f.requester_id=$1 OR f.addressee_id=$1) AND f.status IN ('pending','accepted')
+     WHERE (f.requester_id=$2 OR f.addressee_id=$3) AND f.status IN ('pending','accepted')
      ORDER BY f.created_ts DESC`,
     [playerId, playerId, playerId]);
   return rows.map(r => ({
