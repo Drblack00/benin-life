@@ -186,3 +186,68 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
   background: rgba(13,20,30,.92); color: var(--text); font-size: 24px; line-height: 1; cursor: pointer;
   display: flex; align-items: center; justify-content: center; }
 #map-zoom button:active { background: rgba(34,197,94,.25); }
+
+/* ===== Social: friends & rooms ===== */
+#social-panel, #room-panel, #menu-panel, #dm-panel, #profile-modal {
+  position: fixed; inset: 0; background: rgba(0,0,0,.55);
+  display: flex; align-items: center; justify-content: center; z-index: 20; padding: 16px;
+}
+#social-panel .zone-card, #room-panel .zone-card { max-height: 84dvh; overflow-y: auto; }
+.sp-tabs { display: flex; gap: 8px; margin-bottom: 12px; }
+.sp-tab-btn { flex: 1; padding: 10px; border-radius: 10px; border: 1px solid var(--line);
+  background: var(--panel2); color: var(--text); font-size: 13px; font-weight: 700; cursor: pointer;
+  position: relative; }
+.sp-tab-btn.active { background: var(--accent); color: #06210f; border-color: var(--accent); }
+.sp-addrow { display: flex; gap: 8px; margin-bottom: 12px; }
+.sp-addrow.col { flex-direction: column; }
+.sp-addrow input { flex: 1; padding: 11px; border-radius: 10px; border: 1px solid var(--line);
+  background: #0c1219; color: var(--text); font-size: 14px; min-width: 0; }
+.sp-row { display: flex; align-items: center; gap: 10px; padding: 10px 12px;
+  border: 1px solid var(--line); border-radius: 12px; margin-bottom: 8px; background: var(--panel2); }
+.sp-row b { flex: 1; font-size: 14px; }
+.sp-row.static { opacity: .75; }
+.sp-row.joined { border-color: var(--green); }
+.sp-ricon { font-size: 24px; }
+.sp-rinfo { flex: 1; display: flex; flex-direction: column; }
+.sp-rinfo .muted { font-size: 12px; }
+.sp-empty { text-align: center; color: var(--muted); padding: 20px; font-size: 14px; }
+.sp-mtitle { font-weight: 700; margin: 8px 0; font-size: 14px; }
+.online-dot { width: 10px; height: 10px; border-radius: 50%; background: #475569; flex-shrink: 0; }
+.online-dot.on { background: var(--green); box-shadow: 0 0 6px var(--green); }
+.badge.static { position: static; }
+.muted { color: var(--muted); font-size: 12px; }
+.go.small { padding: 7px 10px; font-size: 13px; }
+.go.danger { background: var(--red); color: #fff; }
+#room-msgs { max-height: 320px; overflow-y: auto; display: flex; flex-direction: column;
+  gap: 6px; margin: 10px 0; padding: 4px; }
+#room-topic { margin-bottom: 4px; }
+#room-members-list { margin-bottom: 10px; }
+.chat-input-row { display: flex; border-top: 1px solid var(--line); }
+.chat-input-row input { flex: 1; border: none; background: #0c1219; color: var(--text);
+  padding: 12px; font-size: 14px; min-width: 0; }
+.chat-input-row button { border: none; background: var(--accent); color: #06210f;
+  font-size: 18px; padding: 0 18px; cursor: pointer; }
+
+/* ===== Responsive audit: phones, tablets, desktop ===== */
+@media (max-width: 720px) {
+  #chat-panel { position: absolute; left: 0; right: 0; bottom: 0; width: auto; max-height: 38dvh;
+    z-index: 9; border-top: 1px solid var(--line); transform: translateY(calc(100% - 42px));
+    transition: transform .25s; }
+  #chat-panel.open { transform: none; }
+  .zone-card.wide, .zone-card { max-width: 100%; }
+  #social-panel, #room-panel, #menu-panel, #dm-panel, #profile-modal { padding: 10px; }
+  #nearby-panel { width: 210px; top: 96px; }
+  .menu-grid { grid-template-columns: repeat(2, 1fr); }
+  .hud-left .pill { font-size: 12px; padding: 6px 10px; }
+  .icon-btn { width: 38px; height: 38px; font-size: 17px; }
+  #room-msgs { max-height: 44dvh; }
+  .sp-addrow { flex-wrap: wrap; }
+}
+@media (min-width: 721px) and (max-width: 1100px) {
+  #chat-panel { width: 260px; }
+  #nearby-panel { width: 220px; }
+}
+@media (min-width: 1400px) {
+  .zone-card.wide { max-width: 560px; }
+  #chat-panel { width: 340px; }
+}

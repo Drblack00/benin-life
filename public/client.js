@@ -19,6 +19,11 @@ const effects = []; // collect sparkles {lat,lng,t0}
 let ZONES = {}, JOBS = {}, FOOD = {}, FUN = {}, HOUSING = {}, BOUNDS = null;
 let BIZT = {}, VEHT = {};
 let myBiz = null, election = { active: false }, governor = null, unreadDm = 0;
+// social
+let friends = []; // {id, other_id, other_username, status, incoming, online, lat, lng}
+let rooms = [];   // {id, name, topic, icon, creator_id, members, joined, unread}
+let openRoomId = null;
+const roomHist = new Map(); // roomId -> [{name,text,ts,gov}]
 let day = 1, dayEndsIn = 0, mode = 'login';
 let currentZone = null, manualClose = false;
 let reconnectTimer = null, manualLogout = false;
@@ -112,6 +117,8 @@ async function handle(m) {
       BIZT = m.bizTypes; VEHT = m.vehicles;
       myBiz = m.biz; election = m.election; governor = m.governor;
       unreadDm = m.unreadDm || 0;
+      friends = m.friends || [];
+      rooms = m.rooms || [];
       speedMult = m.you.speedMult || 1;
       players.clear();
       for (const p of m.players) players.set(p.id, { ...p, tlat: p.lat, tlng: p.lng });
@@ -207,6 +214,57 @@ async function handle(m) {
       break;
     case 'profile':
       renderProfile(m.p);
+      break;
+    case 'friends':
+      friends = m.friends || [];
+      renderFriends(); renderRequests(); updateSocialBadge();
+      break;
+    case 'friend_request':
+      friends = m.friends || friends;
+      renderFriends(); renderRequests(); updateSocialBadge();
+      toast(`🤝 Friend request from ${m.from.username}!`);
+      break;
+    case 'rooms':
+      rooms = m.rooms || [];
+      renderRooms(); updateSocialBadge();
+      break;
+    case 'room_joined': {
+      const r = rooms.find(x => Number(x.id) === Number(m.roomId));
+      if (r) { r.joined = true; r.unread = 0; }
+      if (m.history) roomHist.set(Number(m.roomId), m.history);
+      send({ t: 'room_read', roomId: m.roomId });
+      openRoomView(Number(m.roomId));
+      renderRooms(); updateSocialBadge();
+      break;
+    }
+    case 'room_left': {
+      const rid = Number(m.roomId);
+      const r = rooms.find(x => Number(x.id) === rid);
+      if (r) { r.joined = false; r.unread = 0; }
+      roomHist.delete(rid);
+      if (openRoomId === rid) closeRoomView();
+      renderRooms(); updateSocialBadge();
+      break;
+    }
+    case 'room_msg': {
+      const rid = Number(m.roomId);
+      if (!roomHist.has(rid)) roomHist.set(rid, []);
+      const h = roomHist.get(rid);
+      h.push({ name: m.name, text: m.text, ts: m.ts, gov: m.gov });
+      if (h.length > 50) h.splice(0, h.length - 50);
+      if (openRoomId === rid) { appendRoomMsg(m); send({ t: 'room_read', roomId: rid }); }
+      break;
+    }
+    case 'room_unread': {
+      const r = rooms.find(x => Number(x.id) === Number(m.roomId));
+      if (r && openRoomId !== Number(m.roomId)) { r.unread = m.unread; renderRooms(); updateSocialBadge(); }
+      break;
+    }
+    case 'room_members':
+      renderRoomMembers(Number(m.roomId), m.members || []);
+      break;
+    case 'mention':
+      toast(`💬 ${m.from} mentioned you${m.roomName ? ' in ' + m.roomName : ' in City Chat'}!`);
       break;
     case 'sys': addSys(m.text); break;
     case 'err': toast('⚠️ ' + m.text); break;
@@ -1408,3 +1466,218 @@ async function loadStats() {
 }
 loadStats();
 setInterval(loadStats, 30000);
+
+// ============================================================
+// SOCIAL: friends & topic rooms
+// ============================================================
+function updateSocialBadge() {
+  const reqN = friends.filter(f => f.incoming).length;
+  const roomN = rooms.reduce((a, r) => a + (r.unread || 0), 0);
+  const n = reqN + roomN;
+  const b = $('social-badge');
+  b.textContent = n > 99 ? '99+' : n;
+  b.classList.toggle('hidden', n === 0);
+  const rb = $('req-badge');
+  rb.textContent = reqN;
+  rb.classList.toggle('hidden', reqN === 0);
+}
+function openSocial(tab) {
+  $('social-panel').classList.remove('hidden');
+  document.querySelectorAll('.sp-tab-btn').forEach(x => x.classList.toggle('active', x.dataset.tab === tab));
+  document.querySelectorAll('.sp-tab').forEach(x => x.classList.add('hidden'));
+  $('sp-' + tab).classList.remove('hidden');
+  if (tab === 'friends') renderFriends();
+  if (tab === 'rooms') { send({ t: 'rooms' }); renderRooms(); }
+  if (tab === 'requests') renderRequests();
+}
+function spEmpty(text) {
+  const d = document.createElement('div');
+  d.className = 'sp-empty'; d.textContent = text;
+  return d;
+}
+function renderFriends() {
+  const list = $('friends-list');
+  list.innerHTML = '';
+  const accepted = friends.filter(f => f.status === 'accepted');
+  const pendingOut = friends.filter(f => f.status === 'pending' && !f.incoming);
+  if (!accepted.length && !pendingOut.length) {
+    list.appendChild(spEmpty('No friends yet — add someone by username above 👆'));
+    return;
+  }
+  for (const f of [...accepted, ...pendingOut]) {
+    const div = document.createElement('div');
+    div.className = 'sp-row';
+    const dot = document.createElement('span');
+    dot.className = 'online-dot' + (f.online ? ' on' : '');
+    dot.title = f.online ? 'Online' : 'Offline';
+    const nm = document.createElement('b'); nm.textContent = f.other_username;
+    div.append(dot, nm);
+    if (f.status === 'pending') {
+      const s = document.createElement('span'); s.className = 'muted'; s.textContent = 'request sent…';
+      div.append(s);
+    } else {
+      if (f.online && f.lat != null) {
+        const walk = document.createElement('button');
+        walk.className = 'go small'; walk.textContent = '📍'; walk.title = 'Walk to friend';
+        walk.onclick = () => {
+          clickTarget = { lat: f.lat, lng: f.lng };
+          toast(`🚶 Heading to ${f.other_username}`);
+          $('social-panel').classList.add('hidden');
+        };
+        div.append(walk);
+      }
+      const dm = document.createElement('button');
+      dm.className = 'go small'; dm.textContent = '✉️'; dm.title = 'Message';
+      dm.onclick = () => {
+        $('social-panel').classList.add('hidden');
+        $('dm-panel').classList.remove('hidden');
+        dmWith = f.other_id; dmWithName = f.other_username;
+        send({ t: 'dm_history', with: f.other_id });
+      };
+      const rm = document.createElement('button');
+      rm.className = 'go small danger'; rm.textContent = '✕'; rm.title = 'Remove friend';
+      rm.onclick = () => { if (confirm(`Remove ${f.other_username} from friends?`)) send({ t: 'friend_remove', playerId: f.other_id }); };
+      div.append(dm, rm);
+    }
+    list.appendChild(div);
+  }
+}
+function renderRequests() {
+  const list = $('requests-list');
+  list.innerHTML = '';
+  const inc = friends.filter(f => f.incoming);
+  if (!inc.length) { list.appendChild(spEmpty('No pending friend requests.')); return; }
+  for (const f of inc) {
+    const div = document.createElement('div');
+    div.className = 'sp-row';
+    const nm = document.createElement('b'); nm.textContent = f.other_username;
+    const acc = document.createElement('button'); acc.className = 'go small'; acc.textContent = 'Accept';
+    acc.onclick = () => send({ t: 'friend_accept', playerId: f.other_id });
+    const dec = document.createElement('button'); dec.className = 'go small danger'; dec.textContent = 'Decline';
+    dec.onclick = () => send({ t: 'friend_decline', playerId: f.other_id });
+    div.append(nm, acc, dec);
+    list.appendChild(div);
+  }
+}
+function renderRooms() {
+  const list = $('rooms-list');
+  if (!list) return;
+  list.innerHTML = '';
+  const city = document.createElement('div');
+  city.className = 'sp-row static';
+  const c1 = document.createElement('span'); c1.textContent = '🌆';
+  const c2 = document.createElement('b'); c2.textContent = 'City Chat';
+  const c3 = document.createElement('span'); c3.className = 'muted'; c3.textContent = 'the general — always on';
+  city.append(c1, c2, c3);
+  list.appendChild(city);
+  for (const r of rooms) {
+    const div = document.createElement('div');
+    div.className = 'sp-row' + (r.joined ? ' joined' : '');
+    const ic = document.createElement('span'); ic.className = 'sp-ricon'; ic.textContent = r.icon;
+    const info = document.createElement('div'); info.className = 'sp-rinfo';
+    const nm = document.createElement('b'); nm.textContent = r.name;
+    const tp = document.createElement('span'); tp.className = 'muted';
+    tp.textContent = (r.topic ? r.topic + ' • ' : '') + r.members + (Number(r.members) === 1 ? ' member' : ' members');
+    info.append(nm, tp);
+    div.append(ic, info);
+    if (r.unread > 0) {
+      const b = document.createElement('span'); b.className = 'badge static';
+      b.textContent = r.unread > 99 ? '99+' : r.unread;
+      div.append(b);
+    }
+    const btn = document.createElement('button');
+    btn.className = 'go small';
+    btn.textContent = r.joined ? 'Open' : 'Join';
+    btn.onclick = () => {
+      if (!r.joined) send({ t: 'join_room', roomId: r.id });
+      else openRoomView(Number(r.id));
+    };
+    div.append(btn);
+    list.appendChild(div);
+  }
+}
+function openRoomView(roomId) {
+  openRoomId = roomId;
+  const r = rooms.find(x => Number(x.id) === roomId);
+  $('room-title').textContent = `${r ? r.icon : '💬'} ${r ? r.name : 'Room'}`;
+  $('room-topic').textContent = r && r.topic ? r.topic : '';
+  $('room-msgs').innerHTML = '';
+  $('room-members-list').classList.add('hidden');
+  $('room-members-list').innerHTML = '';
+  for (const m of (roomHist.get(roomId) || [])) appendRoomMsg(m);
+  $('room-panel').classList.remove('hidden');
+  $('social-panel').classList.add('hidden');
+  send({ t: 'room_read', roomId });
+  if (r) { r.unread = 0; renderRooms(); updateSocialBadge(); }
+}
+function closeRoomView() {
+  openRoomId = null;
+  $('room-panel').classList.add('hidden');
+}
+function appendRoomMsg(m) {
+  const box = $('room-msgs');
+  if (!box) return;
+  const d = document.createElement('div');
+  d.className = 'msg' + (m.name === myName ? ' me' : '');
+  const who = document.createElement('span'); who.className = 'who';
+  who.textContent = m.name + (m.gov ? ' 👑' : '');
+  const tx = document.createElement('span'); tx.textContent = ': ' + m.text;
+  d.append(who, tx);
+  box.appendChild(d);
+  box.scrollTop = box.scrollHeight;
+}
+function renderRoomMembers(roomId, members) {
+  const box = $('room-members-list');
+  box.classList.remove('hidden');
+  box.innerHTML = '';
+  const r = rooms.find(x => Number(x.id) === roomId);
+  const canMod = (r && Number(r.creator_id) === me.id) || (me && me.is_admin);
+  const title = document.createElement('div');
+  title.className = 'sp-mtitle'; title.textContent = `Members (${members.length})`;
+  box.appendChild(title);
+  for (const mb of members) {
+    const div = document.createElement('div'); div.className = 'sp-row';
+    const dot = document.createElement('span');
+    dot.className = 'online-dot' + (mb.online ? ' on' : '');
+    const nm = document.createElement('b'); nm.textContent = mb.username;
+    div.append(dot, nm);
+    if (mb.role === 'owner') { const s = document.createElement('span'); s.className = 'muted'; s.textContent = 'owner'; div.append(s); }
+    if (Date.now() < mb.muted_until) { const s = document.createElement('span'); s.className = 'muted'; s.textContent = '🔇 muted'; div.append(s); }
+    if (canMod && mb.player_id !== me.id) {
+      const kick = document.createElement('button'); kick.className = 'go small danger'; kick.textContent = 'Kick';
+      kick.onclick = () => send({ t: 'kick_room', roomId, playerId: mb.player_id });
+      const mute = document.createElement('button'); mute.className = 'go small'; mute.textContent = 'Mute 10m';
+      mute.onclick = () => send({ t: 'mute_room', roomId, playerId: mb.player_id, minutes: 10 });
+      div.append(kick, mute);
+    }
+    box.appendChild(div);
+  }
+}
+$('btn-social').onclick = () => openSocial('friends');
+$('social-close').onclick = () => $('social-panel').classList.add('hidden');
+document.querySelectorAll('.sp-tab-btn').forEach(b => { b.onclick = () => openSocial(b.dataset.tab); });
+$('friend-add-btn').onclick = () => {
+  const v = $('friend-search').value.trim();
+  if (v) { send({ t: 'friend_add', username: v }); $('friend-search').value = ''; }
+};
+$('friend-search').addEventListener('keydown', e => { if (e.key === 'Enter') $('friend-add-btn').click(); });
+$('room-create-btn').onclick = () => {
+  const name = $('room-name').value.trim();
+  if (!name) return toast('Give the room a name.');
+  send({ t: 'create_room', name, topic: $('room-topic').value.trim(), icon: '💬' });
+  $('room-name').value = ''; $('room-topic').value = '';
+};
+$('room-close').onclick = () => closeRoomView();
+$('room-leave-btn').onclick = () => { if (openRoomId) send({ t: 'leave_room', roomId: openRoomId }); };
+$('room-members-btn').onclick = () => {
+  const box = $('room-members-list');
+  if (!openRoomId) return;
+  if (box.classList.contains('hidden')) send({ t: 'room_members', roomId: openRoomId });
+  else { box.classList.add('hidden'); box.innerHTML = ''; }
+};
+const sendRoomChat = () => {
+  const v = $('room-input').value.trim();
+  if (v && openRoomId) { send({ t: 'room_chat', roomId: openRoomId, text: v }); $('room-input').value = ''; }
+};
+$('room-send').onclick = sendRoomChat;
+$('room-input').addEventListener('keydown', e => { if (e.key === 'Enter') sendRoomChat(); });

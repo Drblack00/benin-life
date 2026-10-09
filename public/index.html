@@ -38,6 +38,7 @@
       <button id="btn-recenter" class="icon-btn hidden" title="Follow me">📍</button>
       <button id="btn-dm" class="icon-btn" title="Messages">✉️<span id="dm-badge" class="badge hidden"></span></button>
       <button id="btn-nearby" class="icon-btn" title="Nearby">🔭</button>
+      <button id="btn-social" class="icon-btn" title="Friends & rooms">👥<span id="social-badge" class="badge hidden"></span></button>
       <button id="btn-menu" class="icon-btn" title="Menu">☰</button>
       <button id="btn-admin" class="icon-btn hidden" title="Admin panel">🛠</button>
       <button id="btn-help" class="icon-btn" title="Help">❓</button>
@@ -115,6 +116,57 @@
         <button id="profile-close" class="icon-btn">✕</button>
       </div>
       <div id="profile-body"></div>
+    </div>
+  </div>
+
+  <div id="social-panel" class="hidden">
+    <div class="zone-card wide">
+      <div class="zone-title">👥 Social
+        <button id="social-close" class="icon-btn">✕</button>
+      </div>
+      <div class="sp-tabs">
+        <button data-tab="friends" class="sp-tab-btn active">Friends</button>
+        <button data-tab="rooms" class="sp-tab-btn">Rooms</button>
+        <button data-tab="requests" class="sp-tab-btn">Requests<span id="req-badge" class="badge hidden"></span></button>
+      </div>
+      <div id="sp-friends" class="sp-tab">
+        <div class="sp-addrow">
+          <input id="friend-search" maxlength="20" placeholder="Add friend by username…" autocomplete="off">
+          <button id="friend-add-btn" class="go">Add</button>
+        </div>
+        <div id="friends-list"></div>
+      </div>
+      <div id="sp-rooms" class="sp-tab hidden">
+        <div id="rooms-list"></div>
+        <div class="sp-addrow col">
+          <input id="room-name" maxlength="30" placeholder="New room name…">
+          <input id="room-topic" maxlength="80" placeholder="Topic (optional)…">
+          <button id="room-create-btn" class="go">Create room</button>
+        </div>
+      </div>
+      <div id="sp-requests" class="sp-tab hidden">
+        <div id="requests-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="room-panel" class="hidden">
+    <div class="zone-card wide">
+      <div class="zone-title"><span id="room-title">💬 Room</span>
+        <span id="room-count" class="muted"></span>
+        <button id="room-close" class="icon-btn">✕</button>
+      </div>
+      <div id="room-topic" class="muted"></div>
+      <div id="room-msgs"></div>
+      <div id="room-members-list" class="hidden"></div>
+      <div class="chat-input-row">
+        <input id="room-input" maxlength="200" placeholder="Talk… (try @username)" autocomplete="off">
+        <button id="room-send">➤</button>
+      </div>
+      <div class="arow">
+        <button id="room-members-btn" class="go">Members</button>
+        <button id="room-leave-btn" class="go danger">Leave</button>
+      </div>
     </div>
   </div>
 
