@@ -13,13 +13,13 @@
   <div class="auth-card">
     <div class="logo">🌆</div>
     <h1>BENIN LIFE</h1>
-    <p class="tagline">The city never sleeps. Neither do hustlers.</p>
+    <p class="tagline">The real city. Real players. Real hustle.</p>
     <div class="tabs">
       <button id="tab-login" class="tab active">Log in</button>
       <button id="tab-register" class="tab">Create account</button>
     </div>
     <input id="username" maxlength="16" placeholder="Username" autocomplete="username">
-    <input id="password" type="password" maxlength="72" placeholder="Password" autocomplete="current-password">
+    <input id="password" type="password" maxlength="72" placeholder="Password (min 8 characters)" autocomplete="current-password">
     <button id="auth-btn" class="primary">Enter the city →</button>
     <p id="auth-err" class="err"></p>
     <p class="hint">Real players. Live chat. One Benin City.</p>
@@ -34,6 +34,8 @@
       <span id="hud-cash" class="pill cash">₦10,000</span>
     </div>
     <div class="hud-right">
+      <button id="btn-recenter" class="icon-btn hidden" title="Follow me">📍</button>
+      <button id="btn-admin" class="icon-btn hidden" title="Admin panel">🛠</button>
       <button id="btn-help" class="icon-btn" title="Help">❓</button>
       <button id="btn-logout" class="icon-btn" title="Log out">⏻</button>
     </div>
@@ -46,7 +48,12 @@
   </div>
 
   <div id="main">
-    <canvas id="map"></canvas>
+    <div id="map-wrap">
+      <div id="gmap" class="hidden"></div>
+      <canvas id="map" class="hidden"></canvas>
+      <div id="bubble-layer"></div>
+      <div id="map-fallback-note" class="hidden">🗺️ Stylized map — the real Google map unlocks soon</div>
+    </div>
 
     <div id="chat-panel">
       <div id="chat-head">💬 City Chat <span id="online-count"></span></div>
@@ -80,11 +87,11 @@
     <div class="zone-card">
       <div class="zone-title">❓ How to play <button id="help-close" class="icon-btn">✕</button></div>
       <div class="help-body">
-        <p><b>Move:</b> WASD / arrow keys, tap the map, or the D-pad.</p>
+        <p><b>Move:</b> WASD / arrow keys, tap the map, or the D-pad. This is the real Benin City — Ring Road, Oba Market, UNIBEN and more.</p>
         <p><b>Chat:</b> type below — every real player in the city sees it.</p>
-        <p><b>Hustle:</b> walk into <b>Oba Market</b>, <b>Ring Road</b>, <b>New Benin Market</b> or <b>UNIBEN</b> to find work.</p>
-        <p><b>Survive:</b> eat when hungry, sleep to restore energy, keep your vibe up at the Zoo or Kada Cinema.</p>
-        <p><b>Rent:</b> due every game day (5 real minutes) at the <b>Housing Estate</b>. Miss it 3 times and you're under the bridge.</p>
+        <p><b>Hustle:</b> walk into a marked zone to find work, food and vibes.</p>
+        <p><b>Survive:</b> eat when hungry, sleep to restore energy, keep your vibe up at Ogba Zoo or Kada Plaza.</p>
+        <p><b>Rent:</b> due every game day (5 real minutes) — visit GRA Housing. Miss it 3 times and you're under the bridge.</p>
         <p><b>Level up:</b> study at UNIBEN for a certificate → unlock Graduate Intern.</p>
       </div>
     </div>

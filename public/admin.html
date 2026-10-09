@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Benin Life — Admin</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  #admin-screen { max-width: 900px; margin: 0 auto; padding: 16px; height: 100dvh; overflow-y: auto; }
+  #admin-screen h1 { letter-spacing: 3px; }
+  .atable { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 12px; }
+  .atable th, .atable td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); }
+  .atable th { color: var(--muted); font-weight: 600; }
+  .tag { font-size: 11px; padding: 2px 8px; border-radius: 10px; background: var(--panel2); border: 1px solid var(--line); }
+  .tag.on { color: var(--green); border-color: var(--green); }
+  .tag.adm { color: var(--gold); border-color: var(--gold); }
+  .tag.ban { color: var(--red); border-color: var(--red); }
+  .mini { padding: 5px 10px; font-size: 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel2); color: var(--text); cursor: pointer; margin-right: 4px; }
+  .mini.danger { border-color: var(--red); color: var(--red); }
+  .arow { display: flex; gap: 8px; margin: 12px 0; }
+  .arow input { flex: 1; padding: 11px; border-radius: 10px; border: 1px solid var(--line); background: #0c1219; color: var(--text); font-size: 14px; }
+  #admin-chat { max-height: 320px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div id="admin-screen">
+  <div id="admin-login">
+    <h1>🛠 BENIN LIFE ADMIN</h1>
+    <p class="tagline">Game master control</p>
+    <input id="a-username" placeholder="Admin username" autocomplete="username" style="width:100%;padding:13px;margin-bottom:10px;border-radius:10px;border:1px solid var(--line);background:#0c1219;color:var(--text);font-size:16px">
+    <input id="a-password" type="password" placeholder="Password" autocomplete="current-password" style="width:100%;padding:13px;margin-bottom:10px;border-radius:10px;border:1px solid var(--line);background:#0c1219;color:var(--text);font-size:16px">
+    <button id="a-btn" class="primary">Sign in as admin →</button>
+    <p id="a-err" class="err"></p>
+  </div>
+
+  <div id="admin-dash" class="hidden">
+    <h1>🛠 BENIN LIFE ADMIN</h1>
+    <p class="tagline"><span id="a-online"></span> · <a href="/" style="color:var(--green)">← back to game</a></p>
+
+    <h3>📢 Broadcast to all players</h3>
+    <div class="arow">
+      <input id="b-text" maxlength="200" placeholder="Message the whole city…">
+      <button id="b-send" class="go">Send</button>
+    </div>
+
+    <h3>👥 Players <span id="p-count" class="tag"></span></h3>
+    <div style="overflow-x:auto">
+    <table class="atable">
+      <thead><tr><th>Player</th><th>Status</th><th>Cash</th><th>Housing</th><th>Last seen</th><th>Actions</th></tr></thead>
+      <tbody id="p-body"></tbody>
+    </table>
+    </div>
+
+    <h3>💬 Recent chat</h3>
+    <div id="admin-chat"></div>
+  </div>
+</div>
+<script src="admin.js"></script>
+</body>
+</html>

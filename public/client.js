@@ -1,29 +1,36 @@
 // ============================================================
-// Benin Life — multiplayer client
-// Login, live Benin City map, movement, real-time chat,
-// zone interactions (jobs, food, fun, study, housing, sleep)
+// Benin Life — multiplayer client on a REAL map of Benin City
+// Google Maps renderer (dark-styled) with canvas fallback.
+// Movement, chat, zones and sim systems shared by both.
 // ============================================================
 'use strict';
 
 const $ = (id) => document.getElementById(id);
-const WORLD = { w: 2000, h: 1400 };
+const SPEED = 0.0011; // degrees/sec (~120 m/s, gamey)
 
+let CFG = { mapsKey: '', spawn: { lat: 6.3345, lng: 5.6040 }, bounds: null };
 let ws = null, token = localStorage.getItem('bl_token') || null;
 let myName = localStorage.getItem('bl_name') || null;
-let me = null;                       // my full state
-const players = new Map();           // id -> {id,name,x,y,d,housing}
-let ZONES = {}, JOBS = {}, FOOD = {}, FUN = {}, HOUSING = {};
-let day = 1, dayEndsIn = 0;
-let mode = 'login';                  // or 'register'
+let me = null;
+const players = new Map(); // id -> {id,name,lat,lng,tlat,tlng,housing}
+let ZONES = {}, JOBS = {}, FOOD = {}, FUN = {}, HOUSING = {}, BOUNDS = null;
+let day = 1, dayEndsIn = 0, mode = 'login';
 let currentZone = null, manualClose = false;
 let reconnectTimer = null, manualLogout = false;
-
-// ---------- movement ----------
 const keys = {};
 let clickTarget = null;
-const cam = { x: 0, y: 0, scale: 1 };
-let lastMoveSent = 0;
-const bubbles = []; // {pid, text, until}
+const bubbles = []; // {getPos:()=>{lat,lng}, text, until}
+let renderer = null, loopStarted = false;
+
+function haversineM(lat1, lng1, lat2, lng2) {
+  const R = 6371000, t = Math.PI / 180;
+  const dLat = (lat2 - lat1) * t, dLng = (lng2 - lng1) * t;
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * t) * Math.cos(lat2 * t) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const colorFor = (id) => `hsl(${(id * 137) % 360} 70% 55%)`;
+const fmt = (n) => '₦' + Number(n || 0).toLocaleString();
 
 // ============================================================
 // AUTH
@@ -57,19 +64,16 @@ async function doAuth() {
     localStorage.setItem('bl_token', token);
     localStorage.setItem('bl_name', myName);
     connect();
-  } catch (e) {
-    $('auth-err').textContent = e.message;
-  }
+  } catch (e) { $('auth-err').textContent = e.message; }
   $('auth-btn').disabled = false;
 }
-
 $('btn-logout').onclick = () => {
   manualLogout = true;
-  localStorage.removeItem('bl_token');
-  localStorage.removeItem('bl_name');
+  localStorage.removeItem('bl_token'); localStorage.removeItem('bl_name');
   if (ws) ws.close();
   location.reload();
 };
+$('btn-admin').onclick = () => window.open('admin.html', '_blank');
 
 // ============================================================
 // WEBSOCKET
@@ -79,15 +83,12 @@ function connect() {
   manualLogout = false;
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}/ws?token=${encodeURIComponent(token)}`);
-
-  ws.onopen = () => { $('reconnect').classList.add('hidden'); };
-
+  ws.onopen = () => $('reconnect').classList.add('hidden');
   ws.onmessage = (ev) => {
     let m;
     try { m = JSON.parse(ev.data); } catch { return; }
     handle(m);
   };
-
   ws.onclose = () => {
     if (manualLogout) return;
     $('reconnect').classList.remove('hidden');
@@ -96,46 +97,57 @@ function connect() {
   };
   ws.onerror = () => { try { ws.close(); } catch {} };
 }
-
 function send(m) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); }
 
-function handle(m) {
+async function handle(m) {
   switch (m.t) {
     case 'init':
       me = m.you; day = m.day; dayEndsIn = m.endsIn;
-      ZONES = m.zones; JOBS = m.jobs; FOOD = m.food; FUN = m.fun; HOUSING = m.housing;
+      ZONES = m.zones; JOBS = m.jobs; FOOD = m.food; FUN = m.fun; HOUSING = m.housing; BOUNDS = m.bounds;
       players.clear();
-      for (const p of m.players) players.set(p.id, p);
+      for (const p of m.players) players.set(p.id, { ...p, tlat: p.lat, tlng: p.lng });
       $('auth-screen').classList.add('hidden');
       $('game-screen').classList.remove('hidden');
+      if (me.is_admin) $('btn-admin').classList.remove('hidden');
       $('chat-msgs').innerHTML = '';
       for (const c of m.chat) addChat(c.name, c.text, c.name === myName);
       addSys(`${myName} entered Benin City 🌆`);
-      fit(); updateHUD(); startLoop();
+      await initRenderer();
+      updateHUD(); startLoop();
       break;
-    case 'join':
-      players.set(m.p.id, m.p);
+    case 'join': {
+      const p = { ...m.p, tlat: m.p.lat, tlng: m.p.lng };
+      players.set(m.p.id, p);
+      if (renderer) renderer.playerIn(p);
       addSys(`${m.p.name} entered the city 👋`);
       updateOnline();
       break;
+    }
     case 'leave': {
       const p = players.get(m.id);
       players.delete(m.id);
+      if (renderer) renderer.playerOut(m.id);
       if (p) addSys(`${p.name} left the city`);
       updateOnline();
       break;
     }
     case 'mv': {
       const p = players.get(m.id);
-      if (p) { p.tx = m.x; p.ty = m.y; p.d = m.d; }
+      if (p) { p.tlat = m.lat; p.tlng = m.lng; }
       break;
     }
     case 'chat':
       addChat(m.name, m.text, m.name === myName);
-      bubbleFor(m.id, m.name, m.text);
+      bubbleFor(m.id, m.lat, m.lng, m.text);
+      break;
+    case 'snap':
+      if (me) { me.lat = m.lat; me.lng = m.lng; clickTarget = null; }
       break;
     case 'you':
-      Object.assign(me, { cash: m.cash, energy: m.energy, hunger: m.hunger, happy: m.happy, housing: m.housing, cert: m.cert });
+      Object.assign(me, {
+        cash: m.cash, energy: m.energy, hunger: m.hunger, happy: m.happy,
+        housing: m.housing, cert: m.cert, lat: m.lat, lng: m.lng,
+      });
       updateHUD();
       if (m.note) toast(m.note);
       if (!$('zone-panel').classList.contains('hidden') && currentZone) renderZone(currentZone);
@@ -171,11 +183,12 @@ function addSys(text) {
   box.appendChild(el);
   box.scrollTop = box.scrollHeight;
 }
-function bubbleFor(pid, name, text) {
-  const near = pid === me.id ||
-    (players.get(pid) && dist(players.get(pid), me) < 550);
+function bubbleFor(pid, lat, lng, text) {
+  const near = !me || haversineM(me.lat, me.lng, lat, lng) < 1500 || (me && pid === me.id);
   if (!near) return;
-  bubbles.push({ pid, text: text.slice(0, 80), until: Date.now() + 5000 });
+  const src = pid === (me && me.id) ? me : players.get(pid);
+  bubbles.push({ src: src || { lat, lng }, text: text.slice(0, 80), until: Date.now() + 5000 });
+  if (bubbles.length > 12) bubbles.shift();
 }
 function sendChat() {
   const inp = $('chat-input');
@@ -186,146 +199,227 @@ function sendChat() {
 }
 $('chat-send').onclick = sendChat;
 $('chat-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') sendChat(); });
-function updateOnline() {
-  $('online-count').textContent = `• ${players.size + 1} online`;
-}
+function updateOnline() { $('online-count').textContent = `• ${players.size + 1} online`; }
 
 // ============================================================
-// CANVAS / MAP
+// RENDERERS
 // ============================================================
-const canvas = $('map');
-const ctx = canvas.getContext('2d');
+const DARK_STYLE = [
+  { elementType: 'geometry', stylers: [{ color: '#161d29' }] },
+  { elementType: 'labels.text.stroke', stylers: [{ color: '#161d29' }] },
+  { elementType: 'labels.text.fill', stylers: [{ color: '#8a9bb0' }] },
+  { featureType: 'road', elementType: 'geometry', stylers: [{ color: '#2c3a50' }] },
+  { featureType: 'road.highway', elementType: 'geometry', stylers: [{ color: '#3a4c68' }] },
+  { featureType: 'water', elementType: 'geometry', stylers: [{ color: '#0b1220' }] },
+  { featureType: 'poi', elementType: 'labels', stylers: [{ visibility: 'off' }] },
+  { featureType: 'transit', stylers: [{ visibility: 'off' }] },
+];
 
-function fit() {
-  const r = canvas.getBoundingClientRect();
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  canvas.width = Math.max(1, r.width * dpr);
-  canvas.height = Math.max(1, r.height * dpr);
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-}
-window.addEventListener('resize', fit);
-
-function w2s(x, y) {
-  const r = canvas.getBoundingClientRect();
-  return { x: (x - cam.x) * cam.scale + r.width / 2, y: (y - cam.y) * cam.scale + r.height / 2 };
-}
-function s2w(sx, sy) {
-  const r = canvas.getBoundingClientRect();
-  return { x: (sx - r.width / 2) / cam.scale + cam.x, y: (sy - r.height / 2) / cam.scale + cam.y };
-}
-function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
-function colorFor(id) { return `hsl(${(id * 137) % 360} 70% 55%)`; }
-
-function zoneAt(x, y) {
-  for (const [k, z] of Object.entries(ZONES))
-    if (x >= z.x && x <= z.x + z.w && y >= z.y && y <= z.y + z.h) return k;
-  return null;
+function loadGoogleMaps(key) {
+  return new Promise((resolve, reject) => {
+    if (window.google && window.google.maps) return resolve();
+    const to = setTimeout(() => reject(new Error('timeout')), 10000);
+    window.__blMapsReady = () => { clearTimeout(to); resolve(); };
+    const s = document.createElement('script');
+    s.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(key)}&callback=__blMapsReady`;
+    s.async = true; s.defer = true;
+    s.onerror = () => { clearTimeout(to); reject(new Error('load failed')); };
+    document.head.appendChild(s);
+  });
 }
 
-function draw() {
-  const r = canvas.getBoundingClientRect();
-  const vw = r.width, vh = r.height;
-  ctx.clearRect(0, 0, vw, vh);
+function dotIcon(color, big) {
+  const r = big ? 15 : 12, sz = big ? 38 : 32;
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${sz}" height="${sz}"><circle cx="${sz / 2}" cy="${sz / 2}" r="${r}" fill="${color}" stroke="white" stroke-width="3"/></svg>`;
+  return {
+    url: 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(svg),
+    scaledSize: new google.maps.Size(sz, sz),
+    anchor: new google.maps.Point(sz / 2, sz / 2),
+  };
+}
 
-  // ground
-  ctx.fillStyle = '#14210f';
-  ctx.fillRect(0, 0, vw, vh);
-
-  // subtle grid
-  ctx.strokeStyle = 'rgba(255,255,255,0.03)';
-  ctx.lineWidth = 1;
-  const gs = 100 * cam.scale;
-  const ox = (vw / 2 - cam.x * cam.scale) % gs, oy = (vh / 2 - cam.y * cam.scale) % gs;
-  ctx.beginPath();
-  for (let x = ox; x < vw; x += gs) { ctx.moveTo(x, 0); ctx.lineTo(x, vh); }
-  for (let y = oy; y < vh; y += gs) { ctx.moveTo(0, y); ctx.lineTo(vw, y); }
-  ctx.stroke();
-
-  // roads: spokes from ring road to each zone
-  const ring = ZONES.ring;
-  if (ring) {
-    const c = w2s(ring.x + ring.w / 2, ring.y + ring.h / 2);
-    ctx.strokeStyle = '#3a3f4a'; ctx.lineWidth = 26 * cam.scale; ctx.lineCap = 'round';
+class GoogleRenderer {
+  async init() {
+    $('gmap').classList.remove('hidden');
+    $('btn-recenter').classList.remove('hidden');
+    this.map = new google.maps.Map($('gmap'), {
+      center: { lat: me.lat, lng: me.lng },
+      zoom: 14, styles: DARK_STYLE,
+      disableDefaultUI: true, zoomControl: true,
+      gestureHandling: 'greedy', clickableIcons: false,
+    });
+    // zone circles + labels
     for (const [k, z] of Object.entries(ZONES)) {
-      if (k === 'ring') continue;
-      const p = w2s(z.x + z.w / 2, z.y + z.h / 2);
-      ctx.beginPath(); ctx.moveTo(c.x, c.y); ctx.lineTo(p.x, p.y); ctx.stroke();
+      new google.maps.Circle({
+        center: { lat: z.lat, lng: z.lng }, radius: z.r,
+        strokeColor: z.color, strokeWeight: 2, fillColor: z.color, fillOpacity: 0.18, map: this.map,
+      });
+      new google.maps.Marker({
+        position: { lat: z.lat, lng: z.lng }, map: this.map,
+        icon: { url: 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', scaledSize: new google.maps.Size(1, 1) },
+        label: { text: `${z.icon} ${z.name}`, color: '#eef4fa', fontSize: '13px', fontWeight: '700' },
+        clickable: false,
+      });
     }
-    // ring road circle
-    ctx.strokeStyle = '#f5b301'; ctx.lineWidth = 5 * cam.scale;
-    ctx.beginPath(); ctx.arc(c.x, c.y, 120 * cam.scale, 0, Math.PI * 2); ctx.stroke();
+    this.markers = new Map();
+    this.follow = true;
+    this.followPauseUntil = 0;
+    this.map.addListener('dragstart', () => { this.followPauseUntil = Date.now() + 15000; });
+    this.map.addListener('click', (e) => this.tapCb && this.tapCb(e.latLng.lat(), e.latLng.lng()));
+    // projection overlay for bubbles
+    const ov = new google.maps.OverlayView();
+    ov.onAdd = function () {}; ov.draw = function () {};
+    ov.setMap(this.map);
+    this.overlay = ov;
+    for (const p of players.values()) this.playerIn(p);
+    this.playerIn({ ...me, name: me.name + ' (you)' }, true);
   }
-
-  // zones
-  for (const [k, z] of Object.entries(ZONES)) {
-    const p = w2s(z.x, z.y);
-    const w = z.w * cam.scale, h = z.h * cam.scale;
-    ctx.fillStyle = z.color + '55';
-    ctx.strokeStyle = z.color;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.roundRect(p.x, p.y, w, h, 14 * cam.scale);
-    ctx.fill(); ctx.stroke();
-    ctx.font = `${Math.max(13, 20 * cam.scale)}px sans-serif`;
-    ctx.textAlign = 'center';
-    ctx.fillText(z.icon, p.x + w / 2, p.y + 30 * cam.scale);
-    ctx.font = `600 ${Math.max(11, 14 * cam.scale)}px sans-serif`;
-    ctx.fillStyle = '#eef4fa';
-    ctx.fillText(z.name, p.x + w / 2, p.y + 52 * cam.scale);
+  playerIn(p, isMe) {
+    if (this.markers.has(p.id)) return;
+    const mk = new google.maps.Marker({
+      position: { lat: p.lat, lng: p.lng }, map: this.map,
+      icon: dotIcon(colorFor(p.id), isMe), title: p.name,
+    });
+    this.markers.set(p.id, mk);
   }
-
-  const now = Date.now();
-  // other players (interpolated)
-  for (const p of players.values()) {
-    if (p.tx !== undefined) {
-      p.x = (p.x ?? p.tx) + (p.tx - (p.x ?? p.tx)) * 0.25;
-      p.y = (p.y ?? p.ty) + (p.ty - (p.y ?? p.ty)) * 0.25;
+  playerOut(id) {
+    const mk = this.markers.get(id);
+    if (mk) { mk.setMap(null); this.markers.delete(id); }
+  }
+  frame() {
+    for (const p of players.values()) {
+      const mk = this.markers.get(p.id);
+      if (mk) mk.setPosition({ lat: p.lat, lng: p.lng });
     }
-    drawPlayer(p.x, p.y, p.d || 0, colorFor(p.id), p.name, false);
+    const myMk = this.markers.get(me.id);
+    if (myMk) myMk.setPosition({ lat: me.lat, lng: me.lng });
+    if (this.follow && Date.now() > this.followPauseUntil) this.map.setCenter({ lat: me.lat, lng: me.lng });
   }
-  // me
-  if (me) drawPlayer(me.x, me.y, me.d || 0, colorFor(me.id), me.name + ' (you)', true);
-
-  // speech bubbles
-  for (let i = bubbles.length - 1; i >= 0; i--) {
-    const b = bubbles[i];
-    if (b.until < now) { bubbles.splice(i, 1); continue; }
-    const p = b.pid === (me && me.id) ? me : players.get(b.pid);
-    if (!p) { bubbles.splice(i, 1); continue; }
-    const s = w2s(p.x, p.y - 44);
-    ctx.font = '12px sans-serif';
-    const tw = ctx.measureText(b.text).width + 18;
-    ctx.fillStyle = 'rgba(10,14,20,0.92)';
-    ctx.strokeStyle = '#2b3a4d';
-    ctx.beginPath();
-    ctx.roundRect(s.x - tw / 2, s.y - 20, tw, 26, 8);
-    ctx.fill(); ctx.stroke();
-    ctx.fillStyle = '#eef4fa'; ctx.textAlign = 'center';
-    ctx.fillText(b.text, s.x, s.y - 2);
+  project(lat, lng) {
+    try {
+      const pr = this.overlay.getProjection();
+      if (!pr) return null;
+      const pt = pr.fromLatLngToDivPixel(new google.maps.LatLng(lat, lng));
+      const wrap = $('map-wrap').getBoundingClientRect();
+      const mapEl = $('gmap').getBoundingClientRect();
+      return { x: pt.x + (mapEl.left - wrap.left), y: pt.y + (mapEl.top - wrap.top) };
+    } catch { return null; }
   }
+  onTap(cb) { this.tapCb = cb; }
+  recenter() { this.followPauseUntil = 0; this.map.setCenter({ lat: me.lat, lng: me.lng }); }
 }
 
-function drawPlayer(x, y, d, color, label, isMe) {
-  const s = w2s(x, y);
-  const R = 16 * cam.scale;
-  ctx.beginPath(); ctx.arc(s.x, s.y, R, 0, Math.PI * 2);
-  ctx.fillStyle = color; ctx.fill();
-  if (isMe) { ctx.strokeStyle = '#fff'; ctx.lineWidth = 2.5; ctx.stroke(); }
-  // facing tick
-  ctx.strokeStyle = 'rgba(0,0,0,0.5)'; ctx.lineWidth = 3;
-  ctx.beginPath();
-  ctx.moveTo(s.x, s.y);
-  ctx.lineTo(s.x + Math.cos(d) * R, s.y + Math.sin(d) * R);
-  ctx.stroke();
-  // name
-  ctx.font = `600 ${Math.max(10, 12 * cam.scale)}px sans-serif`;
-  ctx.textAlign = 'center';
-  ctx.fillStyle = isMe ? '#22c55e' : '#eef4fa';
-  ctx.fillText(label, s.x, s.y - R - 8);
+class CanvasRenderer {
+  init() {
+    $('map').classList.remove('hidden');
+    $('map-fallback-note').classList.remove('hidden');
+    this.canvas = $('map');
+    this.ctx = this.canvas.getContext('2d');
+    this.tapCb = null;
+    this.canvas.addEventListener('pointerdown', (e) => {
+      const r = this.canvas.getBoundingClientRect();
+      const ll = this.px2ll(e.clientX - r.left, e.clientY - r.top, r.width, r.height);
+      if (this.tapCb) this.tapCb(ll.lat, ll.lng);
+    });
+    this.fit();
+    window.addEventListener('resize', () => this.fit());
+  }
+  fit() {
+    const r = this.canvas.getBoundingClientRect();
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    this.canvas.width = Math.max(1, r.width * dpr);
+    this.canvas.height = Math.max(1, r.height * dpr);
+    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  scaleFor(w, h) { return Math.min(w, h) / 9000; } // ~9km view
+  ll2px(lat, lng, w, h) {
+    const s = this.scaleFor(w, h);
+    const cx = me ? me.lng : 5.61, cy = me ? me.lat : 6.34;
+    const mpx = 111320 * Math.cos(6.34 * Math.PI / 180) * s;
+    const mpy = 110540 * s;
+    return { x: w / 2 + (lng - cx) * mpx, y: h / 2 - (lat - cy) * mpy, s };
+  }
+  px2ll(x, y, w, h) {
+    const s = this.scaleFor(w, h);
+    const cx = me ? me.lng : 5.61, cy = me ? me.lat : 6.34;
+    const mpx = 111320 * Math.cos(6.34 * Math.PI / 180) * s;
+    const mpy = 110540 * s;
+    return { lat: cy - (y - h / 2) / mpy, lng: cx + (x - w / 2) / mpx };
+  }
+  playerIn() {} playerOut() {}
+  frame() {
+    const ctx = this.ctx, c = this.canvas;
+    const r = c.getBoundingClientRect(), w = r.width, h = r.height;
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = '#0e1622'; ctx.fillRect(0, 0, w, h);
+    const P = (lat, lng) => this.ll2px(lat, lng, w, h);
+    // roads between zones
+    ctx.strokeStyle = '#2c3a50'; ctx.lineWidth = 5; ctx.lineCap = 'round';
+    const zs = Object.values(ZONES);
+    for (let i = 0; i < zs.length; i++) for (let j = i + 1; j < zs.length; j++) {
+      const a = P(zs[i].lat, zs[i].lng), b = P(zs[j].lat, zs[j].lng);
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    }
+    // zones
+    for (const z of zs) {
+      const p = P(z.lat, z.lng), rr = z.r * p.s;
+      ctx.fillStyle = z.color + '55'; ctx.strokeStyle = z.color; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(p.x, p.y, rr, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      ctx.font = '20px sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText(z.icon, p.x, p.y - 6);
+      ctx.font = '700 12px sans-serif'; ctx.fillStyle = '#eef4fa';
+      ctx.fillText(z.name, p.x, p.y + 16);
+    }
+    // players
+    const dot = (lat, lng, color, label, isMe) => {
+      const p = P(lat, lng);
+      ctx.beginPath(); ctx.arc(p.x, p.y, isMe ? 11 : 9, 0, Math.PI * 2);
+      ctx.fillStyle = color; ctx.fill();
+      if (isMe) { ctx.strokeStyle = '#fff'; ctx.lineWidth = 2.5; ctx.stroke(); }
+      ctx.font = '600 11px sans-serif'; ctx.textAlign = 'center';
+      ctx.fillStyle = isMe ? '#22c55e' : '#eef4fa';
+      ctx.fillText(label, p.x, p.y - 16);
+    };
+    for (const p of players.values()) dot(p.lat, p.lng, colorFor(p.id), p.name, false);
+    if (me) dot(me.lat, me.lng, colorFor(me.id), me.name + ' (you)', true);
+  }
+  project(lat, lng) {
+    const r = this.canvas.getBoundingClientRect();
+    const p = this.ll2px(lat, lng, r.width, r.height);
+    const wrap = $('map-wrap').getBoundingClientRect();
+    const cr = this.canvas.getBoundingClientRect();
+    return { x: p.x + (cr.left - wrap.left), y: p.y + (cr.top - wrap.top) };
+  }
+  onTap(cb) { this.tapCb = cb; }
+  recenter() {}
 }
 
-// ---------- main loop ----------
-let loopStarted = false;
+async function initRenderer() {
+  try {
+    const r = await fetch('/api/config');
+    CFG = await r.json();
+  } catch { CFG = { mapsKey: '', spawn: { lat: 6.3345, lng: 5.6040 } }; }
+  let useGoogle = !!CFG.mapsKey;
+  if (useGoogle) {
+    try { await loadGoogleMaps(CFG.mapsKey); }
+    catch (e) { useGoogle = false; toast('🗺️ Map key issue — stylized map active'); }
+  }
+  renderer = useGoogle ? new GoogleRenderer() : new CanvasRenderer();
+  await renderer.init();
+  renderer.onTap((lat, lng) => {
+    if (!BOUNDS) return;
+    clickTarget = {
+      lat: clamp(lat, BOUNDS.latMin, BOUNDS.latMax),
+      lng: clamp(lng, BOUNDS.lngMin, BOUNDS.lngMax),
+    };
+  });
+  $('btn-recenter').onclick = () => renderer.recenter && renderer.recenter();
+}
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+let lastMoveSent = 0;
 function startLoop() {
   if (loopStarted) return;
   loopStarted = true;
@@ -333,62 +427,83 @@ function startLoop() {
   requestAnimationFrame(function frame(now) {
     const dt = Math.min(0.05, (now - last) / 1000);
     last = now;
-    if (me) {
-      updateCamera();
-      movePlayer(dt);
-      const z = zoneAt(me.x, me.y);
+    if (me && renderer) {
+      stepPlayer(dt);
+      // interpolate remotes
+      for (const p of players.values()) {
+        if (p.tlat !== undefined) {
+          p.lat += (p.tlat - p.lat) * 0.2;
+          p.lng += (p.tlng - p.lng) * 0.2;
+        }
+      }
+      renderer.frame();
+      const z = zoneAt(me.lat, me.lng);
       if (z !== currentZone) {
         currentZone = z; manualClose = false;
         if (z) openZone(z); else closeZone();
       }
-      // day countdown
       dayEndsIn = Math.max(0, dayEndsIn - dt * 1000);
+      drawBubbles();
     }
-    draw();
     requestAnimationFrame(frame);
   });
   setInterval(updateHUD, 1000);
+  setInterval(drawBubbles, 300);
 }
 
-function updateCamera() {
-  const r = canvas.getBoundingClientRect();
-  cam.scale = Math.max(0.45, Math.min(1, Math.min(r.width / 1100, r.height / 750)));
-  cam.x += (me.x - cam.x) * 0.12;
-  cam.y += (me.y - cam.y) * 0.12;
-}
-
-function movePlayer(dt) {
-  const speed = 300;
-  let dx = 0, dy = 0;
-  if (keys.up) dy -= 1;
-  if (keys.down) dy += 1;
-  if (keys.left) dx -= 1;
-  if (keys.right) dx += 1;
-  if (dx || dy) {
+function stepPlayer(dt) {
+  let dlat = 0, dlng = 0;
+  if (keys.up) dlat += 1;
+  if (keys.down) dlat -= 1;
+  if (keys.right) dlng += 1;
+  if (keys.left) dlng -= 1;
+  if (dlat || dlng) {
     clickTarget = null;
-    const len = Math.hypot(dx, dy);
-    me.x = clampN(me.x + (dx / len) * speed * dt, 20, WORLD.w - 20);
-    me.y = clampN(me.y + (dy / len) * speed * dt, 20, WORLD.h - 20);
-    me.d = Math.atan2(dy, dx);
+    const n = Math.hypot(dlat, dlng);
+    me.lat = clamp(me.lat + (dlat / n) * SPEED * dt, BOUNDS.latMin, BOUNDS.latMax);
+    me.lng = clamp(me.lng + (dlng / n) * SPEED * dt, BOUNDS.lngMin, BOUNDS.lngMax);
     sendMove();
   } else if (clickTarget) {
-    const d = dist(me, clickTarget);
-    if (d < 8) { clickTarget = null; }
+    const dM = haversineM(me.lat, me.lng, clickTarget.lat, clickTarget.lng);
+    if (dM < 10) { clickTarget = null; }
     else {
-      const step = Math.min(d, speed * dt);
-      me.d = Math.atan2(clickTarget.y - me.y, clickTarget.x - me.x);
-      me.x += ((clickTarget.x - me.x) / d) * step;
-      me.y += ((clickTarget.y - me.y) / d) * step;
+      const stepM = Math.min(dM, SPEED * 111320 * dt);
+      const f = stepM / dM;
+      me.lat = clamp(me.lat + (clickTarget.lat - me.lat) * f, BOUNDS.latMin, BOUNDS.latMax);
+      me.lng = clamp(me.lng + (clickTarget.lng - me.lng) * f, BOUNDS.lngMin, BOUNDS.lngMax);
       sendMove();
     }
   }
 }
-function clampN(v, a, b) { return Math.max(a, Math.min(b, v)); }
 function sendMove() {
   const now = performance.now();
   if (now - lastMoveSent < 100) return;
   lastMoveSent = now;
-  send({ t: 'move', x: Math.round(me.x), y: Math.round(me.y), d: +me.d.toFixed(2) });
+  send({ t: 'move', lat: +me.lat.toFixed(6), lng: +me.lng.toFixed(6) });
+}
+function zoneAt(lat, lng) {
+  for (const [k, z] of Object.entries(ZONES))
+    if (haversineM(lat, lng, z.lat, z.lng) <= z.r) return k;
+  return null;
+}
+
+function drawBubbles() {
+  const layer = $('bubble-layer');
+  const now = Date.now();
+  // prune
+  for (let i = bubbles.length - 1; i >= 0; i--) if (bubbles[i].until < now) bubbles.splice(i, 1);
+  layer.innerHTML = '';
+  if (!renderer) return;
+  for (const b of bubbles) {
+    const pt = renderer.project(b.src.lat, b.src.lng);
+    if (!pt) continue;
+    const el = document.createElement('div');
+    el.className = 'map-bubble';
+    el.style.left = pt.x + 'px';
+    el.style.top = (pt.y - 46) + 'px';
+    el.textContent = b.text;
+    layer.appendChild(el);
+  }
 }
 
 // ---------- input ----------
@@ -409,11 +524,6 @@ function keyName(k) {
   if (k === 'arrowright' || k === 'd') return 'right';
   return null;
 }
-canvas.addEventListener('pointerdown', (e) => {
-  const r = canvas.getBoundingClientRect();
-  clickTarget = s2w(e.clientX - r.left, e.clientY - r.top);
-});
-// D-pad
 document.querySelectorAll('#dpad button').forEach((b) => {
   const k = b.dataset.k;
   const on = (e) => { e.preventDefault(); keys[k] = true; clickTarget = null; };
@@ -427,7 +537,6 @@ document.querySelectorAll('#dpad button').forEach((b) => {
 // ============================================================
 // HUD + ZONE PANELS
 // ============================================================
-const fmt = (n) => '₦' + Number(n || 0).toLocaleString();
 function updateHUD() {
   if (!me) return;
   const mm = String(Math.floor(dayEndsIn / 60000)).padStart(1, '0');
@@ -439,14 +548,12 @@ function updateHUD() {
   $('bar-happy').style.width = me.happy + '%';
   updateOnline();
 }
-
 function toast(text) {
   const el = document.createElement('div');
   el.className = 'toast'; el.textContent = text;
   $('toast-wrap').appendChild(el);
   setTimeout(() => el.remove(), 3200);
 }
-
 function openZone(key) {
   if (manualClose && currentZone === key) return;
   $('zone-icon').textContent = ZONES[key].icon;
@@ -474,6 +581,8 @@ function row(title, sub, btnText, fn, disabled) {
   d.appendChild(info); d.appendChild(btn);
   return d;
 }
+function section(t) { const p = document.createElement('p'); p.innerHTML = `<b>${t}</b>`; p.style.margin = '10px 0 6px'; return p; }
+function note(t) { const p = document.createElement('p'); p.style.cssText = 'color:#93a5b8;font-size:13px'; p.textContent = t; return p; }
 
 function renderZone(key) {
   const body = $('zone-body');
@@ -495,7 +604,7 @@ function renderZone(key) {
     body.appendChild(section('💼 Jobs here'));
     for (const [jk, j] of jobsHere)
       body.appendChild(row(j.name, `₦${j.pay.toLocaleString()} • -${j.energy}⚡`, 'Work', () => send({ t: 'act', a: 'work', job: jk })));
-    body.appendChild(note('The heartbeat of Benin City. Keke drivers rule these roads.'));
+    body.appendChild(note("The heartbeat of Benin City. Keke drivers rule these roads."));
   }
   if (key === 'uniben') {
     body.appendChild(section('🎓 Education'));
@@ -522,12 +631,8 @@ function renderZone(key) {
         () => send({ t: 'act', a: 'rent', h: hk }), me.housing === hk));
     }
   }
-  // rest section everywhere
   body.appendChild(section('😴 Rest'));
   body.appendChild(row('Sleep', 'Restore ⚡ to full • -15🍲', 'Sleep', () => send({ t: 'act', a: 'sleep' })));
-
-  function section(t) { const p = document.createElement('p'); p.innerHTML = `<b>${t}</b>`; p.style.margin = '10px 0 6px'; return p; }
-  function note(t) { const p = document.createElement('p'); p.style.cssText = 'color:#93a5b8;font-size:13px'; p.textContent = t; return p; }
 }
 
 // chat toggle on touch devices
@@ -543,4 +648,3 @@ if (token && myName) {
   $('username').value = myName;
   connect();
 }
-fit();
