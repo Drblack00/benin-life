@@ -535,11 +535,11 @@ class CanvasRenderer {
         if (this.parks.some(p => Math.hypot(x - p.x, y - p.y) < p.r + 70)) continue;
         if (Object.values(ZM).some(z => Math.hypot(x - z.x, y - z.y) < z.r + 130)) continue;
         const w = 45 + rnd() * 70, h = 45 + rnd() * 70;
-        const sh = 222 + rnd() * 20;
+        const sh = 22 + rnd() * 16;
         const warm = rnd() < 0.18;
         this.buildings.push({
           x: x - w / 2, y: y - h / 2, w, h,
-          c: warm ? `rgb(${sh},${sh - 10},${sh - 26})` : `rgb(${sh - 8},${sh - 2},${sh - 6})`,
+          c: warm ? `rgb(${sh + 14},${sh + 4},${sh - 2})` : `rgb(${sh},${sh + 7},${sh + 14})`,
         });
       }
     }
@@ -660,96 +660,90 @@ class CanvasRenderer {
     const z = this.cam.z;
     const S = (x, y) => this.w2s(x, y, w, h);
     const t = performance.now() / 1000;
-    // === bright GO-style land ===
+    // === original dark theme ===
     const g = ctx.createLinearGradient(0, 0, 0, h);
-    g.addColorStop(0, '#b9dcc9'); g.addColorStop(1, '#a2cbb6');
+    g.addColorStop(0, '#0d1622'); g.addColorStop(1, '#090f17');
     ctx.fillStyle = g; ctx.fillRect(0, 0, w, h);
     const x0 = this.cam.x - w / 2 / z, x1 = this.cam.x + w / 2 / z;
     const y0 = this.cam.y - h / 2 / z, y1 = this.cam.y + h / 2 / z;
     const vis = (x, y, m) => x > x0 - m && x < x1 + m && y > y0 - m && y < y1 + m;
     ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-    // river — bright blue
-    ctx.strokeStyle = '#57a8d8'; ctx.lineWidth = 300 * z;
+    // river
+    ctx.strokeStyle = '#0d2839'; ctx.lineWidth = 300 * z;
     ctx.beginPath();
     this.river.forEach(([x, y], i) => { const s = S(x, y); i ? ctx.lineTo(s.x, s.y) : ctx.moveTo(s.x, s.y); });
     ctx.stroke();
-    ctx.strokeStyle = '#7fc4e9'; ctx.lineWidth = 215 * z;
+    ctx.strokeStyle = '#123449'; ctx.lineWidth = 230 * z;
     ctx.stroke();
-    // parks — vivid green
+    // parks
     for (const p of this.parks) {
       if (!vis(p.x, p.y, p.r)) continue;
       const s = S(p.x, p.y);
-      ctx.fillStyle = '#7fc47c';
+      ctx.fillStyle = '#122b1a';
       ctx.beginPath(); ctx.arc(s.x, s.y, p.r * z, 0, Math.PI * 2); ctx.fill();
-      ctx.fillStyle = '#a3d9a0';
-      ctx.beginPath(); ctx.arc(s.x, s.y, p.r * 0.7 * z, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#163722';
+      ctx.beginPath(); ctx.arc(s.x, s.y, p.r * 0.72 * z, 0, Math.PI * 2); ctx.fill();
     }
-    // buildings — light blocks
+    // buildings
     for (const b of this.buildings) {
       if (b.x > x1 || b.x + b.w < x0 || b.y > y1 || b.y + b.h < y0) continue;
       const s = S(b.x, b.y);
       ctx.fillStyle = b.c;
       ctx.fillRect(s.x, s.y, Math.max(1.5, b.w * z), Math.max(1.5, b.h * z));
     }
-    // roads — white with soft casing
+    // roads (proper network, dark)
     for (const rd of this.roads) {
-      const ww = Math.max(3, rd.w * z);
-      const path = () => {
-        ctx.beginPath();
-        rd.pts.forEach(([x, y], i) => { const s = S(x, y); i ? ctx.lineTo(s.x, s.y) : ctx.moveTo(s.x, s.y); });
-      };
-      ctx.strokeStyle = '#d5dcd6'; ctx.lineWidth = ww + 3;
-      path(); ctx.stroke();
-      ctx.strokeStyle = '#ffffff'; ctx.lineWidth = ww;
-      path(); ctx.stroke();
+      ctx.strokeStyle = rd.c; ctx.lineWidth = Math.max(2, rd.w * z);
+      ctx.beginPath();
+      rd.pts.forEach(([x, y], i) => { const s = S(x, y); i ? ctx.lineTo(s.x, s.y) : ctx.moveTo(s.x, s.y); });
+      ctx.stroke();
+      if (rd.dash && z > 0.008) {
+        ctx.strokeStyle = 'rgba(214,178,74,0.5)'; ctx.lineWidth = Math.max(1, 3 * z * 10);
+        ctx.setLineDash([16 * z * 10, 22 * z * 10]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
     }
-    // === zone stops (GO-stop style badges) ===
+    // === zones: original glowing circles ===
     for (const [k, zv] of Object.entries(ZONES)) {
       const zm = this.ZM[k];
       if (!vis(zm.x, zm.y, zv.r)) continue;
-      const s = S(zm.x, zm.y);
+      const s = S(zm.x, zm.y), rad = zv.r * z;
       const inRange = meZone === k;
-      const R = Math.max(19, Math.min(30, 25 * Math.sqrt(z / (this._bz || z))));
-      ctx.save();
-      if (!inRange) ctx.globalAlpha = 0.6;
+      const glow = ctx.createRadialGradient(s.x, s.y, rad * 0.15, s.x, s.y, rad);
+      glow.addColorStop(0, zv.color + '66'); glow.addColorStop(1, zv.color + '0d');
+      ctx.fillStyle = glow;
+      ctx.beginPath(); ctx.arc(s.x, s.y, rad, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = zv.color; ctx.lineWidth = inRange ? 3.5 : 2;
+      ctx.setLineDash([10, 8]); ctx.lineDashOffset = -t * 12;
+      ctx.beginPath(); ctx.arc(s.x, s.y, rad, 0, Math.PI * 2); ctx.stroke();
+      ctx.setLineDash([]);
       if (inRange) {
-        const pulse = 1 + Math.sin(t * 4) * 0.07;
-        ctx.fillStyle = 'rgba(47,128,237,0.22)';
-        ctx.beginPath(); ctx.arc(s.x, s.y, R * 1.6 * pulse, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.arc(s.x, s.y, rad + 6 + Math.sin(t * 4) * 3, 0, Math.PI * 2); ctx.stroke();
       }
-      ctx.fillStyle = 'rgba(30,50,70,0.18)';
-      ctx.beginPath(); ctx.arc(s.x + 2, s.y + 4, R + 5, 0, Math.PI * 2); ctx.fill();
-      ctx.fillStyle = '#ffffff';
-      ctx.beginPath(); ctx.arc(s.x, s.y, R + 5, 0, Math.PI * 2); ctx.fill();
-      const disc = ctx.createRadialGradient(s.x - R * 0.3, s.y - R * 0.3, R * 0.2, s.x, s.y, R);
-      disc.addColorStop(0, inRange ? '#55a0f6' : '#6a9bd8');
-      disc.addColorStop(1, inRange ? '#1f6fe0' : '#4a76b8');
-      ctx.fillStyle = disc;
-      ctx.beginPath(); ctx.arc(s.x, s.y, R, 0, Math.PI * 2); ctx.fill();
-      ctx.restore();
-      ctx.font = `${Math.round(R * 1.05)}px sans-serif`;
-      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      ctx.fillText(zv.icon, s.x, s.y + 1);
-      ctx.textBaseline = 'alphabetic';
-      if (z > (this._bz || z) * 0.55)
-        this.pill(s.x, s.y + R + 20, zv.name, '700 12px sans-serif', '#1c2b3a', '#ffffff');
+      const fs = Math.max(15, Math.min(26, 20 * Math.sqrt(z / (this._bz || z))));
+      ctx.font = `${Math.round(fs)}px sans-serif`; ctx.textAlign = 'center';
+      ctx.fillText(zv.icon, s.x, s.y - 6);
+      if (z > (this._bz || z) * 0.5)
+        this.pill(s.x, s.y + 20, zv.name, '700 12px sans-serif', '#eef4fa', 'rgba(10,15,22,0.85)');
     }
-    // === street-find spawns ===
+    // === street-find spawns (kept, restyled for dark) ===
     for (const sp of spawns.values()) {
       const m = this.ll2m(sp.lat, sp.lng);
       if (!vis(m.x, m.y, 200)) continue;
       const s = S(m.x, m.y);
       const bob = Math.sin(t * 3 + sp.id * 1.7) * 5;
       const d = me ? haversineM(me.lat, me.lng, sp.lat, sp.lng) : 9999;
-      ctx.fillStyle = 'rgba(30,50,70,0.20)';
+      ctx.fillStyle = 'rgba(0,0,0,0.35)';
       ctx.beginPath(); ctx.ellipse(s.x, s.y + 15, 12, 5, 0, 0, Math.PI * 2); ctx.fill();
       if (d <= 300) {
-        ctx.strokeStyle = 'rgba(20,184,166,0.85)'; ctx.lineWidth = 2.5;
+        ctx.strokeStyle = 'rgba(34,197,94,0.9)'; ctx.lineWidth = 2.5;
         ctx.beginPath(); ctx.arc(s.x, s.y + bob, 21, 0, Math.PI * 2); ctx.stroke();
       }
       ctx.fillStyle = '#ffffff';
       ctx.beginPath(); ctx.arc(s.x, s.y + bob, 16, 0, Math.PI * 2); ctx.fill();
-      ctx.strokeStyle = '#dbe3ea'; ctx.lineWidth = 2; ctx.stroke();
+      ctx.strokeStyle = '#cbd5e1'; ctx.lineWidth = 2; ctx.stroke();
       ctx.font = '20px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
       ctx.fillText(sp.icon, s.x, s.y + bob + 1);
       ctx.textBaseline = 'alphabetic';
@@ -774,7 +768,7 @@ class CanvasRenderer {
     if (me && clickTarget) {
       const a = this.ll2m(me.lat, me.lng), b = this.ll2m(clickTarget.lat, clickTarget.lng);
       const sa = S(a.x, a.y), sb = S(b.x, b.y);
-      ctx.strokeStyle = 'rgba(20,184,166,0.8)'; ctx.lineWidth = 3;
+      ctx.strokeStyle = 'rgba(34,197,94,0.75)'; ctx.lineWidth = 3;
       ctx.setLineDash([8, 8]); ctx.lineDashOffset = -t * 30;
       ctx.beginPath(); ctx.moveTo(sa.x, sa.y); ctx.lineTo(sb.x, sb.y); ctx.stroke();
       ctx.setLineDash([]);
@@ -782,36 +776,34 @@ class CanvasRenderer {
       ctx.font = `${Math.round(20 * pulse)}px sans-serif`; ctx.textAlign = 'center';
       ctx.fillText('🚩', sb.x, sb.y - 8);
     }
-    // === player (GO-style pin on pulsing disc) ===
-    const pin = (lat, lng, label, labelColor, isMe, gov) => {
+    // === players: original dots ===
+    const dot = (lat, lng, color, label, isMe, gov) => {
       const m = this.ll2m(lat, lng), p = S(m.x, m.y);
       if (isMe) {
-        ctx.strokeStyle = 'rgba(20,184,166,0.35)'; ctx.lineWidth = 2;
+        ctx.strokeStyle = 'rgba(34,197,94,0.28)'; ctx.lineWidth = 2;
         ctx.setLineDash([10, 10]);
         ctx.beginPath(); ctx.arc(p.x, p.y, 300 * z, 0, Math.PI * 2); ctx.stroke();
         ctx.setLineDash([]);
-        ctx.fillStyle = 'rgba(20,184,166,0.20)';
-        ctx.beginPath(); ctx.arc(p.x, p.y, 24, 0, Math.PI * 2); ctx.fill();
-        const pr = 26 + ((t * 30) % 36);
-        ctx.strokeStyle = `rgba(20,184,166,${Math.max(0, 0.55 - pr / 75)})`;
-        ctx.lineWidth = 3;
+        const pr = 14 + ((t * 22) % 26);
+        ctx.strokeStyle = `rgba(34,197,94,${Math.max(0, 0.5 - pr / 60)})`;
+        ctx.lineWidth = 2.5;
         ctx.beginPath(); ctx.arc(p.x, p.y, pr, 0, Math.PI * 2); ctx.stroke();
       }
-      ctx.fillStyle = 'rgba(30,50,70,0.25)';
-      ctx.beginPath(); ctx.ellipse(p.x, p.y + 15, 12, 5, 0, 0, Math.PI * 2); ctx.fill();
-      ctx.fillStyle = '#ffffff';
-      ctx.beginPath(); ctx.arc(p.x, p.y, isMe ? 14 : 11, 0, Math.PI * 2); ctx.fill();
-      ctx.strokeStyle = isMe ? '#14b8a6' : '#94a3b8'; ctx.lineWidth = isMe ? 3.5 : 2.5;
-      ctx.stroke();
-      ctx.fillStyle = labelColor; ctx.font = `700 ${isMe ? 14 : 12}px sans-serif`;
-      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      ctx.fillText(label.charAt(0).toUpperCase(), p.x, p.y + 1);
-      ctx.textBaseline = 'alphabetic';
-      this.pill(p.x, p.y - (isMe ? 30 : 26), label, '700 11px sans-serif', isMe ? '#0f766e' : '#334155', '#ffffff');
-      if (gov) { ctx.font = '16px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('👑', p.x, p.y - 48); }
+      ctx.beginPath(); ctx.arc(p.x, p.y, isMe ? 11 : 9, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.shadowColor = color; ctx.shadowBlur = 12;
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      if (isMe) { ctx.strokeStyle = '#fff'; ctx.lineWidth = 2.5; ctx.stroke(); }
+      this.pill(p.x, p.y - 24, label, '600 11px sans-serif', isMe ? '#22c55e' : '#eef4fa', 'rgba(10,15,22,0.8)');
+      if (gov) { ctx.font = '15px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('👑', p.x, p.y - 44); }
     };
-    for (const p of players.values()) pin(p.lat, p.lng, p.name, '#334155', false, p.gov);
-    if (me) pin(me.lat, me.lng, me.name, '#0f766e', true, me.gov);
+    for (const p of players.values()) dot(p.lat, p.lng, colorFor(p.id), p.name, false, p.gov);
+    if (me) dot(me.lat, me.lng, colorFor(me.id), me.name, true, me.gov);
+    // subtle vignette
+    const v = ctx.createRadialGradient(w / 2, h / 2, Math.min(w, h) * 0.42, w / 2, h / 2, Math.max(w, h) * 0.75);
+    v.addColorStop(0, 'rgba(0,0,0,0)'); v.addColorStop(1, 'rgba(0,0,0,0.42)');
+    ctx.fillStyle = v; ctx.fillRect(0, 0, w, h);
   }
   project(lat, lng) {
     const r = this.canvas.getBoundingClientRect();
@@ -1094,7 +1086,7 @@ const MENU_ITEMS = [
   ['runs', '🏃', 'Street Runs'],
 ];
 function esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
-$('menu-fab').onclick = () => openMenu(null);
+$('btn-menu').onclick = () => openMenu(null);
 $('btn-nearby').onclick = () => {
   const p = $('nearby-panel');
   p.classList.toggle('hidden');
