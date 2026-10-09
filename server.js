@@ -6,8 +6,8 @@
 // - Global live chat with rate limiting + profanity filter
 // - Server-authoritative game actions (work, eat, fun, study,
 //   sleep, housing) so cash/stats can't be faked by clients
-// - Game-day loop with automatic weekly-style rent deduction
-// - SQLite persistence (node:sqlite, no native deps)
+// - Game-day loop with automatic rent deduction
+// - PostgreSQL in production (DATABASE_URL), SQLite locally
 // ============================================================
 
 import express from 'express';
@@ -15,9 +15,12 @@ import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
-import { DatabaseSync } from 'node:sqlite';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import {
+  initDb, dbMode, getPlayerByName, getPlayerById,
+  createPlayer, savePlayer, addChat, recentChat,
+} from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -71,40 +74,8 @@ const STUDY_COST = 5000;
 const BAD_WORDS = ['fuck', 'shit', 'bitch', 'nigga', 'nigger', 'dick', 'pussy', 'asshole', 'bastard', 'whore', 'slut'];
 
 // ---------------- Database ----------------
-const db = new DatabaseSync(path.join(__dirname, 'benin-life.db'));
-db.exec(`
-  CREATE TABLE IF NOT EXISTS players (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    pass_hash TEXT NOT NULL,
-    cash INTEGER NOT NULL DEFAULT 10000,
-    energy INTEGER NOT NULL DEFAULT 100,
-    hunger INTEGER NOT NULL DEFAULT 100,
-    happy INTEGER NOT NULL DEFAULT 80,
-    housing TEXT NOT NULL DEFAULT 'face-me',
-    cert INTEGER NOT NULL DEFAULT 0,
-    x REAL NOT NULL DEFAULT 1000,
-    y REAL NOT NULL DEFAULT 700,
-    misses INTEGER NOT NULL DEFAULT 0,
-    created_at INTEGER NOT NULL,
-    last_seen INTEGER NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS chatlog (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT NOT NULL,
-    text TEXT NOT NULL,
-    ts INTEGER NOT NULL
-  );
-`);
-const q = {
-  byName: db.prepare('SELECT * FROM players WHERE username = ?'),
-  byId: db.prepare('SELECT * FROM players WHERE id = ?'),
-  insert: db.prepare(`INSERT INTO players (username, pass_hash, cash, energy, hunger, happy, housing, cert, x, y, misses, created_at, last_seen)
-                      VALUES (?, ?, 10000, 100, 100, 80, 'face-me', 0, 1000, 700, 0, ?, ?)`),
-  save: db.prepare('UPDATE players SET cash=?, energy=?, hunger=?, happy=?, housing=?, cert=?, x=?, y=?, misses=?, last_seen=? WHERE id=?'),
-  chat: db.prepare('INSERT INTO chatlog (username, text, ts) VALUES (?, ?, ?)'),
-  recentChat: db.prepare('SELECT username, text, ts FROM chatlog ORDER BY id DESC LIMIT 40'),
-};
+await initDb();
+let chatMemory = (await recentChat()).map(r => ({ name: r.username, text: r.text, ts: Number(r.ts) }));
 
 // ---------------- Auth tokens ----------------
 function signToken(id) {
@@ -145,31 +116,31 @@ function authLimit(req, res, next) {
 
 const USER_RE = /^[a-zA-Z0-9_]{3,16}$/;
 
-app.post('/api/register', authLimit, (req, res) => {
+app.post('/api/register', authLimit, async (req, res) => {
   const username = String(req.body.username || '').trim();
   const password = String(req.body.password || '');
   if (!USER_RE.test(username)) return res.status(400).json({ error: 'Username: 3-16 letters, numbers or _.' });
   if (password.length < 4 || password.length > 72) return res.status(400).json({ error: 'Password: min 4 characters.' });
-  if (q.byName.get(username)) return res.status(409).json({ error: 'Username taken.' });
+  if (await getPlayerByName(username)) return res.status(409).json({ error: 'Username taken.' });
   const hash = bcrypt.hashSync(password, 10);
   const now = Date.now();
-  const r = q.insert.run(username, hash, now, now);
-  res.json({ token: signToken(Number(r.lastInsertRowid)), username });
+  const id = await createPlayer(username, hash, now);
+  res.json({ token: signToken(id), username });
 });
 
-app.post('/api/login', authLimit, (req, res) => {
+app.post('/api/login', authLimit, async (req, res) => {
   const username = String(req.body.username || '').trim();
   const password = String(req.body.password || '');
-  const row = q.byName.get(username);
+  const row = await getPlayerByName(username);
   if (!row || !bcrypt.compareSync(password, row.pass_hash)) {
     return res.status(401).json({ error: 'Wrong username or password.' });
   }
-  q.save.run(row.cash, row.energy, row.hunger, row.happy, row.housing, row.cert, row.x, row.y, row.misses, Date.now(), row.id);
+  await savePlayer({ ...row, last_seen: Date.now() });
   res.json({ token: signToken(row.id), username: row.username });
 });
 
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, online: online.size, day });
+  res.json({ ok: true, online: online.size, day, db: dbMode() });
 });
 
 const server = createServer(app);
@@ -179,7 +150,6 @@ const wss = new WebSocketServer({ server, path: '/ws' });
 const online = new Map(); // id -> { ws, p, lastMove, lastChat, cds: {} }
 let day = 1;
 let dayStart = Date.now();
-let chatMemory = q.recentChat.all().reverse().map(r => ({ name: r.username, text: r.text, ts: r.ts }));
 
 function pub(p) {
   return { id: p.id, name: p.username, x: Math.round(p.x), y: Math.round(p.y), d: p.d || 0, housing: p.housing };
@@ -209,13 +179,13 @@ function clean(text) {
   for (const w of BAD_WORDS) t = t.replace(new RegExp(w, 'gi'), '***');
   return t;
 }
-function persist(o) {
+async function persist(o) {
   const p = o.p;
-  q.save.run(p.cash, p.energy, p.hunger, p.happy, p.housing, p.cert, p.x, p.y, p.misses, Date.now(), p.id);
+  await savePlayer({ ...p, last_seen: Date.now() });
 }
 
 // ---------------- Game actions (server-authoritative) ----------------
-function doAct(o, m) {
+async function doAct(o, m) {
   const p = o.p;
   const now = Date.now();
   const cdLeft = (key) => {
@@ -234,7 +204,7 @@ function doAct(o, m) {
     o.cds['work:' + m.job] = now + job.cd * 1000;
     p.energy = clamp(p.energy - job.energy, 0, 100);
     p.cash += job.pay;
-    persist(o);
+    await persist(o);
     pushYou(o, `+₦${job.pay.toLocaleString()} — ${job.name} shift done 💪`);
   }
   else if (m.a === 'eat') {
@@ -245,7 +215,7 @@ function doAct(o, m) {
     p.hunger = clamp(p.hunger + f.hunger, 0, 100);
     p.energy = clamp(p.energy + f.energy, 0, 100);
     p.happy = clamp(p.happy + f.happy, 0, 100);
-    persist(o);
+    await persist(o);
     pushYou(o, `${f.name} devoured 😋`);
   }
   else if (m.a === 'fun') {
@@ -257,7 +227,7 @@ function doAct(o, m) {
     p.cash -= f.cost;
     p.happy = clamp(p.happy + f.happy, 0, 100);
     p.energy = clamp(p.energy + f.energy, 0, 100);
-    persist(o);
+    await persist(o);
     pushYou(o, `${f.name} — vibes restored ✨`);
   }
   else if (m.a === 'study') {
@@ -270,7 +240,7 @@ function doAct(o, m) {
     p.cash -= STUDY_COST;
     p.energy = clamp(p.energy - 15, 0, 100);
     p.cert = 1;
-    persist(o);
+    await persist(o);
     pushYou(o, '🎓 Certificate earned! Graduate Intern unlocked.');
   }
   else if (m.a === 'sleep') {
@@ -279,7 +249,7 @@ function doAct(o, m) {
     o.cds.sleep = now + 60 * 1000;
     p.energy = 100;
     p.hunger = clamp(p.hunger - 15, 0, 100);
-    persist(o);
+    await persist(o);
     pushYou(o, '😴 Fully rested.');
   }
   else if (m.a === 'rent') {
@@ -288,7 +258,7 @@ function doAct(o, m) {
     if (!inZone(p, 'housing')) return sys(o, 'Go to the Housing Estate to change housing.');
     p.housing = m.h;
     p.misses = 0;
-    persist(o);
+    await persist(o);
     pushYou(o, `Moved to: ${h.name} 🏠`);
   }
   else {
@@ -296,7 +266,7 @@ function doAct(o, m) {
   }
 }
 
-function chargeRent(o) {
+async function chargeRent(o) {
   const p = o.p;
   const h = HOUSING[p.housing] || HOUSING['face-me'];
   if (h.rent === 0) return;
@@ -315,23 +285,23 @@ function chargeRent(o) {
       sys(o, `⚠️ Landlord is knocking! Rent missed (${p.misses}/3). Pay ₦${h.rent.toLocaleString()} soon.`);
     }
   }
-  persist(o);
+  await persist(o);
   pushYou(o);
 }
 
 // ---------------- WebSocket ----------------
-wss.on('connection', (ws, req) => {
+wss.on('connection', async (ws, req) => {
   const url = new URL(req.url, 'http://x');
   const id = verifyToken(url.searchParams.get('token'));
   if (!id) { ws.close(4401, 'bad token'); return; }
-  const row = q.byId.get(id);
+  const row = await getPlayerById(id);
   if (!row) { ws.close(4401, 'no player'); return; }
 
   // Kick any older session for this player
   const old = online.get(id);
   if (old) { try { old.ws.close(4409, 'new session'); } catch {} }
 
-  const o = { ws, p: { ...row, d: 0 }, lastMove: 0, lastChat: 0, cds: {} };
+  const o = { ws, p: { ...row, cash: Number(row.cash), energy: Number(row.energy), hunger: Number(row.hunger), happy: Number(row.happy), x: Number(row.x), y: Number(row.y), misses: Number(row.misses), cert: Number(row.cert), d: 0 }, lastMove: 0, lastChat: 0, cds: {} };
   online.set(id, o);
   console.log(`[+] ${row.username} connected (${online.size} online)`);
 
@@ -345,7 +315,7 @@ wss.on('connection', (ws, req) => {
   });
   broadcast({ t: 'join', p: pub(o.p) }, id);
 
-  ws.on('message', (raw) => {
+  ws.on('message', async (raw) => {
     let m;
     try { m = JSON.parse(raw.toString()); } catch { return; }
     const now = Date.now();
@@ -366,18 +336,18 @@ wss.on('connection', (ws, req) => {
       const entry = { name: o.p.username, text, ts: now };
       chatMemory.push(entry);
       if (chatMemory.length > 60) chatMemory = chatMemory.slice(-60);
-      q.chat.run(o.p.username, text, now);
+      await addChat(o.p.username, text, now).catch(e => console.error('[chat]', e.message));
       broadcast({ t: 'chat', id, ...entry });
     }
     else if (m.t === 'act') {
-      doAct(o, m);
+      await doAct(o, m).catch(e => { console.error('[act]', e.message); sys(o, 'Something went wrong, try again.'); });
     }
   });
 
   ws.on('close', () => {
     if (online.get(id) === o) {
       online.delete(id);
-      persist(o);
+      persist(o).catch(e => console.error('[save]', e.message));
       broadcast({ t: 'leave', id });
       console.log(`[-] ${o.p.username} left (${online.size} online)`);
     }
@@ -385,12 +355,12 @@ wss.on('connection', (ws, req) => {
 });
 
 // ---------------- Game loop ----------------
-setInterval(() => {
+setInterval(async () => {
   // Day rollover
   if (Date.now() - dayStart >= DAY_MS) {
     day++;
     dayStart = Date.now();
-    for (const o of online.values()) chargeRent(o);
+    await Promise.all([...online.values()].map(o => chargeRent(o).catch(e => console.error('[rent]', e.message))));
     broadcast({ t: 'day', day, endsIn: DAY_MS });
     console.log(`[day] Day ${day} — ${online.size} online`);
   }
@@ -405,14 +375,14 @@ setInterval(() => {
       p.energy = clamp(p.energy - 5, 0, 100);
       p.happy = clamp(p.happy - 5, 0, 100);
     }
-    persist(o);
+    persist(o).catch(e => console.error('[save]', e.message));
     pushYou(o);
   }
 }, 60000);
 
 // Periodic position save
-setInterval(() => { for (const o of online.values()) persist(o); }, SAVE_MS);
+setInterval(() => { for (const o of online.values()) persist(o).catch(e => console.error('[save]', e.message)); }, SAVE_MS);
 
 server.listen(PORT, () => {
-  console.log(`🌆 Benin Life server live on port ${PORT} — Day ${day}`);
+  console.log(`🌆 Benin Life server live on port ${PORT} — Day ${day} — db: ${dbMode()}`);
 });
