@@ -1,13 +1,18 @@
 // ============================================================
 // Benin Life — multiplayer game server
 // Real-time life simulator on a real map of Benin City, Nigeria.
-// - Player accounts (register/login, bcrypt, lockout on abuse)
-// - Live player presence + movement broadcast (WebSocket)
-// - Global live chat with rate limiting + profanity filter
-// - Server-authoritative game actions (anti-cheat: speed checks,
-//   zone checks, bounds checks — clients can't fake anything)
-// - Game-day loop with automatic rent deduction
-// - Admin API: player list, chat log, broadcast, ban/unban
+//
+// Systems:
+// - Accounts (bcrypt, lockout), live movement + chat (WebSocket)
+// - Jobs, food, fun, education, sleep, housing/rent (game-day loop)
+// - Elections: weekly Governor votes — run, vote, govern
+// - Businesses: buy shops, earn daily income
+// - Bank: savings with interest, loans with interest
+// - Vehicles: keke/car = faster movement (server-validated)
+// - Street runs: risky hustle — police wahala, fines, detention
+// - Dice betting (fictional currency)
+// - DMs: private player messages; player profiles
+// - Admin API: players, chat, broadcast, ban, election control
 // - PostgreSQL in production (DATABASE_URL), SQLite locally
 // ============================================================
 
@@ -20,8 +25,12 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import {
   initDb, dbMode, getPlayerByName, getPlayerById, createPlayer,
-  savePlayer, saveGame, countAdmins, listPlayers, setBanned, setAdmin,
-  addChat, recentChat,
+  saveGame, countAdmins, listPlayers, setBanned, setAdmin,
+  addChat, recentChat, getBusiness, createBusiness, listBusinesses,
+  currentElection, createElection, closeElection, lastWinner,
+  addCandidate, listCandidates, hasVoted, castVote, topCandidate,
+  addDm, dmThreads, dmHistory, unreadDmCount, markDmRead,
+  getMeta, setMeta, bumpVisits,
 } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -33,11 +42,12 @@ if (!process.env.SESSION_SECRET) {
   console.warn('[warn] SESSION_SECRET not set — using dev default. Set it in production!');
 }
 const MAPS_KEY = process.env.GOOGLE_MAPS_API_KEY || '';
-// Benin City playable bounds (city and environs)
 const BOUNDS = { latMin: 6.27, latMax: 6.43, lngMin: 5.56, lngMax: 5.67 };
-const MAX_SPEED_MPS = 250; // anti-cheat: nobody moves faster than this
+const BASE_MAX_SPEED_MPS = 250; // anti-cheat baseline (foot)
 const DAY_MS = 5 * 60 * 1000;
 const SAVE_MS = 30 * 1000;
+const ELECTION_DAYS = 7; // game days per election cycle
+const RUN_FEE = 50000;
 
 // ---------------- Game data: real Benin City coordinates ----------------
 const ZONES = {
@@ -76,7 +86,20 @@ const HOUSING = {
   bridge:    { name: 'Under the Bridge',   rent: 0 },
 };
 
+const BIZ = {
+  mamaput:  { name: 'Mama Put Spot', cost: 50000,  income: 3000,  icon: '🍲' },
+  boutique: { name: 'Boutique',      cost: 150000, income: 8000,  icon: '👗' },
+  lounge:   { name: 'Lounge & Bar',  cost: 400000, income: 20000, icon: '🍾' },
+};
+
+const VEHICLES = {
+  none: { name: 'Trek (on foot)', cost: 0,      mult: 1,   icon: '🚶' },
+  keke: { name: 'Keke Napep',     cost: 80000,  mult: 1.6,  icon: '🛺' },
+  car:  { name: 'Toyota Camry',   cost: 300000, mult: 2.2,  icon: '🚗' },
+};
+
 const STUDY_COST = 5000;
+const GOV_SALARY = 25000;
 const BAD_WORDS = ['fuck', 'shit', 'bitch', 'nigga', 'nigger', 'dick', 'pussy', 'asshole', 'bastard', 'whore', 'slut'];
 
 // ---------------- Database ----------------
@@ -105,6 +128,7 @@ function clean(text) {
   for (const w of BAD_WORDS) t = t.replace(new RegExp(w, 'gi'), '***');
   return t;
 }
+function speedMultOf(p) { return (VEHICLES[p.vehicle] || VEHICLES.none).mult; }
 
 // ---------------- Auth tokens ----------------
 function signToken(id) {
@@ -140,7 +164,6 @@ async function adminFromReq(req) {
 const app = express();
 app.use(express.json({ limit: '32kb' }));
 
-// Security headers
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
@@ -151,7 +174,6 @@ app.use((req, res, next) => {
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Rate limiter for auth endpoints (per IP)
 const authHits = new Map();
 function authLimit(req, res, next) {
   const ip = req.ip || 'x';
@@ -162,7 +184,6 @@ function authLimit(req, res, next) {
   if (arr.length > 10) return res.status(429).json({ error: 'Too many attempts, slow down.' });
   next();
 }
-// Per-account lockout: 5 failed logins -> 15 min block
 const lockouts = new Map();
 function lockCheck(name) {
   const l = lockouts.get(name);
@@ -186,7 +207,7 @@ app.post('/api/register', authLimit, async (req, res) => {
   if (await getPlayerByName(username)) return res.status(409).json({ error: 'Username taken.' });
   const hash = bcrypt.hashSync(password, 10);
   const now = Date.now();
-  const makeAdmin = (await countAdmins()) === 0; // first account ever = game admin
+  const makeAdmin = (await countAdmins()) === 0;
   const id = await createPlayer(username, hash, now, makeAdmin);
   res.json({ token: signToken(id), username, is_admin: makeAdmin });
 });
@@ -211,7 +232,12 @@ app.get('/api/health', (req, res) => {
   res.json({ ok: true, online: online.size, day, db: dbMode() });
 });
 
-// Public client config (maps key is referrer-restricted, safe to expose)
+app.get('/api/stats', async (req, res) => {
+  const visits = Number((await getMeta('visits')) || 0);
+  const gov = governorId ? (await getPlayerById(governorId)) : null;
+  res.json({ online: online.size, visits, governor: gov ? gov.username : null });
+});
+
 app.get('/api/config', (req, res) => {
   res.json({ mapsKey: MAPS_KEY, spawn: SPAWN, bounds: BOUNDS });
 });
@@ -230,6 +256,7 @@ app.get('/api/admin/players', requireAdmin, async (req, res) => {
     id: r.id, username: r.username, cash: Number(r.cash), energy: Number(r.energy),
     hunger: Number(r.hunger), happy: Number(r.happy), housing: r.housing,
     cert: Number(r.cert), lat: Number(r.lat), lng: Number(r.lng),
+    vehicle: r.vehicle, savings: Number(r.savings), loan: Number(r.loan),
     is_admin: !!Number(r.is_admin), banned: !!Number(r.banned),
     online: onlineIds.has(r.id), last_seen: Number(r.last_seen),
   })));
@@ -260,17 +287,27 @@ app.post('/api/admin/make-admin', requireAdmin, async (req, res) => {
   await setAdmin(target.id, true);
   res.json({ ok: true });
 });
+app.get('/api/admin/election', requireAdmin, async (req, res) => {
+  const el = await currentElection();
+  res.json({ election: el, candidates: el ? await listCandidates(el.id) : [], governorId });
+});
+app.post('/api/admin/end-election', requireAdmin, async (req, res) => {
+  await tallyElection(true);
+  res.json({ ok: true, governorId });
+});
 
 const server = createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
 // ---------------- Live state ----------------
-const online = new Map(); // id -> { ws, p, lastMove, lastChat, lastPos, cds: {} }
+const online = new Map();
 let day = 1;
 let dayStart = Date.now();
+let election = null;
+let governorId = 0;
 
 function pub(p) {
-  return { id: p.id, name: p.username, lat: p.lat, lng: p.lng, housing: p.housing };
+  return { id: p.id, name: p.username, lat: p.lat, lng: p.lng, housing: p.housing, gov: p.id === governorId };
 }
 function broadcast(msg, exceptId) {
   const s = JSON.stringify(msg);
@@ -285,16 +322,60 @@ function send(o, msg) {
 function sys(o, text) { send(o, { t: 'sys', text }); }
 function pushYou(o, note) {
   const p = o.p;
-  send(o, { t: 'you', cash: p.cash, energy: p.energy, hunger: p.hunger, happy: p.happy, housing: p.housing, cert: p.cert, lat: p.lat, lng: p.lng, note: note || null });
+  send(o, {
+    t: 'you', cash: p.cash, energy: p.energy, hunger: p.hunger, happy: p.happy,
+    housing: p.housing, cert: p.cert, lat: p.lat, lng: p.lng,
+    vehicle: p.vehicle, savings: p.savings, loan: p.loan,
+    speedMult: speedMultOf(p), detained: Date.now() < o.detainedUntil,
+    gov: p.id === governorId, note: note || null,
+  });
 }
 async function persist(o) {
   await saveGame({ ...o.p, last_seen: Date.now() });
+}
+
+// ---------------- Elections ----------------
+async function tallyElection(forced) {
+  const el = await currentElection();
+  if (!el) return;
+  const top = await topCandidate(el.id);
+  const winnerId = top ? top.player_id : 0;
+  await closeElection(el.id, winnerId || null);
+  if (winnerId) {
+    governorId = winnerId;
+    await setMeta('governor_id', winnerId);
+    const w = await getPlayerById(winnerId);
+    broadcast({ t: 'sys', text: `👑 ${w ? w.username : 'Someone'} is the new Governor of Benin City!` });
+    broadcast({ t: 'gov', id: winnerId, name: w ? w.username : '' });
+  } else {
+    broadcast({ t: 'sys', text: `🗳️ Election ended with no candidates. A new race begins!` });
+  }
+  election = await createElection(day, day + ELECTION_DAYS);
+  broadcast({ t: 'election', ...(await electionState(null)) });
+  console.log(`[election] #${el.id} closed, winner=${winnerId || 'none'}`);
+}
+
+async function electionState(playerId) {
+  const el = await currentElection();
+  if (!el) return { active: false };
+  const candidates = await listCandidates(el.id);
+  return {
+    active: true, id: el.id,
+    endsInDays: Math.max(0, el.end_day - day),
+    candidates,
+    voted: playerId ? await hasVoted(el.id, playerId) : false,
+    running: playerId ? candidates.some(c => Number(c.player_id) === playerId) : false,
+    governorId,
+  };
 }
 
 // ---------------- Game actions (server-authoritative) ----------------
 async function doAct(o, m) {
   const p = o.p;
   const now = Date.now();
+  if (now < o.detainedUntil && !['chat'].includes(m.a)) {
+    return sys(o, `⛓️ You're in detention for ${Math.ceil((o.detainedUntil - now) / 1000)}s. Sit this one out.`);
+  }
   const cdLeft = (key) => {
     const until = o.cds[key] || 0;
     return until > now ? Math.ceil((until - now) / 1000) : 0;
@@ -368,6 +449,142 @@ async function doAct(o, m) {
     await persist(o);
     pushYou(o, `Moved to: ${h.name} 🏠`);
   }
+  // ---------- Elections ----------
+  else if (m.a === 'run') {
+    const el = await currentElection();
+    if (!el) return sys(o, 'No election running right now.');
+    const cands = await listCandidates(el.id);
+    if (cands.some(c => Number(c.player_id) === p.id)) return sys(o, 'You are already running.');
+    if (p.cash < RUN_FEE) return sys(o, `Campaign fee is ₦${RUN_FEE.toLocaleString()}.`);
+    p.cash -= RUN_FEE;
+    await addCandidate(el.id, p.id);
+    await persist(o);
+    pushYou(o, `🗳️ You're on the ballot! Campaign across the city.`);
+    broadcast({ t: 'sys', text: `🗳️ ${p.username} is running for Governor!` });
+  }
+  else if (m.a === 'vote') {
+    const el = await currentElection();
+    if (!el) return sys(o, 'No election running right now.');
+    const cid = Number(m.candidate);
+    const cands = await listCandidates(el.id);
+    if (!cands.some(c => Number(c.player_id) === cid)) return sys(o, 'That candidate is not running.');
+    if (await hasVoted(el.id, p.id)) return sys(o, 'You already voted in this election.');
+    await castVote(el.id, p.id, cid);
+    pushYou(o, '🗳️ Vote cast! Results at the end of the race.');
+    send(o, { t: 'election', ...(await electionState(p.id)) });
+  }
+  else if (m.a === 'gov_broadcast') {
+    if (p.id !== governorId) return sys(o, 'Only the Governor can do that.');
+    const left = cdLeft('govbc');
+    if (left) return sys(o, `Governor broadcast available in ${left}s.`);
+    const text = clean(m.text);
+    if (!text) return;
+    o.cds.govbc = now + 24 * 3600 * 1000;
+    broadcast({ t: 'sys', text: `👑 Governor ${p.username}: ${text}` });
+  }
+  // ---------- Business ----------
+  else if (m.a === 'buy_biz') {
+    const b = BIZ[m.biz];
+    if (!b) return sys(o, 'Unknown business.');
+    if (await getBusiness(p.id)) return sys(o, 'You already own a business. One empire at a time!');
+    if (p.cash < b.cost) return sys(o, `You need ₦${b.cost.toLocaleString()} to open this.`);
+    p.cash -= b.cost;
+    await createBusiness(p.id, m.biz, now);
+    await persist(o);
+    send(o, { t: 'biz', biz: m.biz });
+    pushYou(o, `${b.icon} You now own a ${b.name}! Income lands every game day.`);
+  }
+  // ---------- Bank ----------
+  else if (m.a === 'bank') {
+    const amt = Math.floor(Number(m.amount));
+    if (!amt || amt <= 0) return sys(o, 'Enter a valid amount.');
+    if (m.op === 'deposit') {
+      if (p.cash < amt) return sys(o, "You don't have that much cash.");
+      p.cash -= amt; p.savings += amt;
+      await persist(o);
+      pushYou(o, `🏦 Deposited ₦${amt.toLocaleString()}. Savings earn 2%/day.`);
+    } else if (m.op === 'withdraw') {
+      if (p.savings < amt) return sys(o, "You don't have that much saved.");
+      p.savings -= amt; p.cash += amt;
+      await persist(o);
+      pushYou(o, `🏦 Withdrew ₦${amt.toLocaleString()}.`);
+    }
+  }
+  else if (m.a === 'loan') {
+    const amt = Math.floor(Number(m.amount));
+    if (!amt || amt <= 0 || amt > 100000) return sys(o, 'Loans: ₦1 – ₦100,000.');
+    if (p.loan > 0) return sys(o, 'Repay your current loan first.');
+    p.loan = amt; p.cash += amt;
+    await persist(o);
+    pushYou(o, `🏦 Loan of ₦${amt.toLocaleString()} approved. 10% daily interest — don't play!`);
+  }
+  else if (m.a === 'repay') {
+    const amt = Math.floor(Number(m.amount));
+    if (!amt || amt <= 0) return sys(o, 'Enter a valid amount.');
+    if (p.loan <= 0) return sys(o, 'You have no loan.');
+    const pay = Math.min(amt, p.loan, p.cash);
+    if (pay <= 0) return sys(o, "You don't have the cash.");
+    p.cash -= pay; p.loan -= pay;
+    await persist(o);
+    pushYou(o, p.loan > 0 ? `Repaid ₦${pay.toLocaleString()}. ₦${p.loan.toLocaleString()} left.` : '🎉 Loan fully repaid!');
+  }
+  // ---------- Vehicles ----------
+  else if (m.a === 'buy_vehicle') {
+    const v = VEHICLES[m.v];
+    if (!v || m.v === 'none') return sys(o, 'Unknown vehicle.');
+    if (p.vehicle === m.v) return sys(o, 'You already own this.');
+    if (p.cash < v.cost) return sys(o, `You need ₦${v.cost.toLocaleString()}.`);
+    p.cash -= v.cost;
+    p.vehicle = m.v;
+    await persist(o);
+    pushYou(o, `${v.icon} ${v.name} acquired! You move ${v.mult}x faster.`);
+  }
+  // ---------- Street runs (crime risk) ----------
+  else if (m.a === 'runs') {
+    const left = cdLeft('runs');
+    if (left) return sys(o, `Lay low for ${left}s.`);
+    o.cds.runs = now + 120 * 1000;
+    const r = Math.random();
+    if (r < 0.60) {
+      const gain = 3000 + Math.floor(Math.random() * 5000);
+      p.cash += gain;
+      p.energy = clamp(p.energy - 10, 0, 100);
+      await persist(o);
+      pushYou(o, `🏃 Street runs paid off: +₦${gain.toLocaleString()}. No wahala this time.`);
+    } else if (r < 0.85) {
+      await persist(o);
+      pushYou(o, '👀 Police dey road — you dodge am. Nothing gained, nothing lost.');
+    } else {
+      if (p.cash >= 10000) {
+        p.cash -= 10000;
+        await persist(o);
+        pushYou(o, '🚔 Police wahala! They seized ₦10,000 as "bail".');
+      } else {
+        o.detainedUntil = now + 3 * 60 * 1000;
+        await persist(o);
+        pushYou(o, '⛓️ Caught! 3 minutes detention. Think about your life choices.');
+      }
+    }
+  }
+  // ---------- Dice betting ----------
+  else if (m.a === 'bet') {
+    const amt = Math.floor(Number(m.amount));
+    const pick = Math.floor(Number(m.pick));
+    if (!amt || amt < 100 || amt > 10000) return sys(o, 'Stake: ₦100 – ₦10,000.');
+    if (!pick || pick < 1 || pick > 6) return sys(o, 'Pick a number 1–6.');
+    if (p.cash < amt) return sys(o, "You can't cover that stake.");
+    p.cash -= amt;
+    const roll = 1 + Math.floor(Math.random() * 6);
+    if (roll === pick) {
+      const win = amt * 5;
+      p.cash += win;
+      await persist(o);
+      pushYou(o, `🎲 Rolled ${roll} — JACKPOT! +₦${win.toLocaleString()}`);
+    } else {
+      await persist(o);
+      pushYou(o, `🎲 Rolled ${roll}, you picked ${pick}. Stake gone. Try again?`);
+    }
+  }
   else {
     sys(o, 'Unknown action.');
   }
@@ -396,6 +613,54 @@ async function chargeRent(o) {
   pushYou(o);
 }
 
+// Daily economy: business income, bank interest, loan interest, governor salary
+async function runEconomy() {
+  try {
+    // businesses pay owners (online or not)
+    for (const b of await listBusinesses()) {
+      const def = BIZ[b.type];
+      if (!def) continue;
+      const owner = await getPlayerById(b.owner_id);
+      if (!owner) continue;
+      owner.cash = Number(owner.cash) + def.income;
+      await saveGame(owner);
+      const o = online.get(owner.id);
+      if (o) {
+        o.p.cash = owner.cash;
+        pushYou(o, `${def.icon} ${def.name} earned you ₦${def.income.toLocaleString()} today.`);
+      }
+    }
+    // bank interest + loan interest for everyone
+    for (const r of await listPlayers()) {
+      let dirty = false;
+      const p = { ...r, cash: Number(r.cash), savings: Number(r.savings), loan: Number(r.loan) };
+      if (p.savings > 0) {
+        const interest = Math.floor(p.savings * 0.02);
+        p.savings += interest; p.cash += 0; dirty = true;
+        const o = online.get(p.id);
+        if (o) { o.p.savings = p.savings; pushYou(o, `🏦 Savings interest: +₦${interest.toLocaleString()}`); }
+      }
+      if (p.loan > 0) {
+        const interest = Math.ceil(p.loan * 0.10);
+        p.loan += interest; dirty = true;
+        const o = online.get(p.id);
+        if (o) { o.p.loan = p.loan; sys(o, `🏦 Loan interest: +₦${interest.toLocaleString()} (now ₦${p.loan.toLocaleString()}). Repay am!`); }
+      }
+      if (dirty) await saveGame(p);
+    }
+    // governor salary
+    if (governorId) {
+      const g = await getPlayerById(governorId);
+      if (g) {
+        g.cash = Number(g.cash) + GOV_SALARY;
+        await saveGame(g);
+        const o = online.get(governorId);
+        if (o) { o.p.cash = g.cash; pushYou(o, `👑 Governor salary: +₦${GOV_SALARY.toLocaleString()}`); }
+      }
+    }
+  } catch (e) { console.error('[economy]', e.message); }
+}
+
 // ---------------- WebSocket ----------------
 wss.on('connection', async (ws, req) => {
   const url = new URL(req.url, 'http://x');
@@ -416,24 +681,36 @@ wss.on('connection', async (ws, req) => {
       happy: Number(row.happy), lat: Number(row.lat), lng: Number(row.lng),
       misses: Number(row.misses), cert: Number(row.cert),
       is_admin: Number(row.is_admin), banned: Number(row.banned),
+      vehicle: row.vehicle || 'none', savings: Number(row.savings) || 0,
+      loan: Number(row.loan) || 0, dm_read_ts: Number(row.dm_read_ts) || 0,
     },
-    lastMove: 0, lastChat: 0, lastPos: null, cds: {},
+    lastMove: 0, lastChat: 0, lastPos: null, cds: {}, detainedUntil: 0,
   };
-  // clamp spawned position into bounds (safety for old rows)
   if (!inBounds(o.p.lat, o.p.lng)) { o.p.lat = SPAWN.lat; o.p.lng = SPAWN.lng; }
   o.lastPos = { lat: o.p.lat, lng: o.p.lng, ts: Date.now() };
   online.set(id, o);
+  const visits = await bumpVisits().catch(() => 0);
   console.log(`[+] ${row.username} connected (${online.size} online)`);
+
+  const biz = await getBusiness(id);
+  const govRow = governorId ? await getPlayerById(governorId) : null;
 
   send(o, {
     t: 'init',
-    you: { ...pub(o.p), cash: o.p.cash, energy: o.p.energy, hunger: o.p.hunger, happy: o.p.happy, cert: o.p.cert, is_admin: !!o.p.is_admin },
+    you: { ...pub(o.p), cash: o.p.cash, energy: o.p.energy, hunger: o.p.hunger, happy: o.p.happy, cert: o.p.cert, is_admin: !!o.p.is_admin, vehicle: o.p.vehicle, savings: o.p.savings, loan: o.p.loan, speedMult: speedMultOf(o.p) },
     players: [...online.values()].filter(x => x.p.id !== id).map(x => pub(x.p)),
     day, endsIn: Math.max(0, DAY_MS - (Date.now() - dayStart)),
     chat: chatMemory.slice(-40),
     zones: ZONES, jobs: JOBS, food: FOOD, fun: FUN, housing: HOUSING, bounds: BOUNDS,
+    bizTypes: BIZ, vehicles: VEHICLES,
+    biz: biz ? biz.type : null,
+    election: await electionState(id),
+    governor: govRow ? { id: govRow.id, name: govRow.username } : null,
+    unreadDm: await unreadDmCount(id),
+    visits,
   });
   broadcast({ t: 'join', p: pub(o.p) }, id);
+  broadcast({ t: 'stats', online: online.size });
 
   ws.on('message', async (raw) => {
     let m;
@@ -443,13 +720,13 @@ wss.on('connection', async (ws, req) => {
     if (m.t === 'move') {
       if (now - o.lastMove < 40) return;
       o.lastMove = now;
+      if (now < o.detainedUntil) return send(o, { t: 'snap', lat: o.p.lat, lng: o.p.lng });
       const lat = Number(m.lat), lng = Number(m.lng);
-      if (!isFinite(lat) || !isFinite(lng) || !inBounds(lat, lng)) return; // invalid: ignore
-      // anti-cheat: speed check against last accepted position
+      if (!isFinite(lat) || !isFinite(lng) || !inBounds(lat, lng)) return;
+      const maxSpeed = BASE_MAX_SPEED_MPS * speedMultOf(o.p);
       const dt = Math.max(0.05, (now - o.lastPos.ts) / 1000);
       const d = haversineM(o.lastPos.lat, o.lastPos.lng, lat, lng);
-      if (d / dt > MAX_SPEED_MPS) {
-        // teleport attempt: snap client back
+      if (d / dt > maxSpeed) {
         send(o, { t: 'snap', lat: o.p.lat, lng: o.p.lng });
         return;
       }
@@ -462,7 +739,7 @@ wss.on('connection', async (ws, req) => {
       o.lastChat = now;
       const text = clean(m.text);
       if (!text) return;
-      const entry = { name: o.p.username, text, ts: now };
+      const entry = { name: o.p.username, text, ts: now, gov: o.p.id === governorId };
       chatMemory.push(entry);
       if (chatMemory.length > 60) chatMemory = chatMemory.slice(-60);
       await addChat(o.p.username, text, now).catch(e => console.error('[chat]', e.message));
@@ -471,6 +748,48 @@ wss.on('connection', async (ws, req) => {
     else if (m.t === 'act') {
       await doAct(o, m).catch(e => { console.error('[act]', e.message); sys(o, 'Something went wrong, try again.'); });
     }
+    else if (m.t === 'dm') {
+      const toId = Number(m.to);
+      const target = toId && toId !== o.p.id ? await getPlayerById(toId) : null;
+      if (!target) return send(o, { t: 'err', text: 'Player not found.' });
+      const text = clean(m.text);
+      if (!text) return;
+      await addDm(o.p.id, toId, text, now);
+      const to = online.get(toId);
+      if (to) {
+        send(to, { t: 'dm', from: o.p.id, fromName: o.p.username, text, ts: now });
+        send(to, { t: 'dm_unread', n: await unreadDmCount(toId) });
+      }
+      send(o, { t: 'dm_sent', to: toId });
+    }
+    else if (m.t === 'dm_threads') {
+      send(o, { t: 'dm_threads', threads: await dmThreads(o.p.id) });
+    }
+    else if (m.t === 'dm_history') {
+      const withId = Number(m.with);
+      const other = withId ? await getPlayerById(withId) : null;
+      if (!other) return;
+      send(o, { t: 'dm_history', with: withId, withName: other.username, msgs: await dmHistory(o.p.id, withId) });
+    }
+    else if (m.t === 'dm_read') {
+      o.p.dm_read_ts = now;
+      await markDmRead(o.p.id, now);
+      send(o, { t: 'dm_unread', n: 0 });
+    }
+    else if (m.t === 'profile') {
+      const tp = await getPlayerById(Number(m.id));
+      if (!tp) return;
+      const tbiz = await getBusiness(tp.id);
+      send(o, {
+        t: 'profile',
+        p: {
+          id: tp.id, username: tp.username, cash: Number(tp.cash),
+          housing: tp.housing, vehicle: tp.vehicle || 'none', cert: !!Number(tp.cert),
+          biz: tbiz ? tbiz.type : null, gov: tp.id === governorId,
+          online: online.has(tp.id),
+        },
+      });
+    }
   });
 
   ws.on('close', () => {
@@ -478,6 +797,7 @@ wss.on('connection', async (ws, req) => {
       online.delete(id);
       persist(o).catch(e => console.error('[save]', e.message));
       broadcast({ t: 'leave', id });
+      broadcast({ t: 'stats', online: online.size });
       console.log(`[-] ${o.p.username} left (${online.size} online)`);
     }
   });
@@ -489,6 +809,9 @@ setInterval(async () => {
     day++;
     dayStart = Date.now();
     await Promise.all([...online.values()].map(o => chargeRent(o).catch(e => console.error('[rent]', e.message))));
+    await runEconomy();
+    const el = await currentElection();
+    if (el && day >= el.end_day) await tallyElection(false);
     broadcast({ t: 'day', day, endsIn: DAY_MS });
     console.log(`[day] Day ${day} — ${online.size} online`);
   }
@@ -508,6 +831,11 @@ setInterval(() => {
 }, 60000);
 
 setInterval(() => { for (const o of online.values()) persist(o).catch(e => console.error('[save]', e.message)); }, SAVE_MS);
+
+// ---------------- Boot ----------------
+election = await currentElection();
+if (!election) election = await createElection(1, 1 + ELECTION_DAYS);
+governorId = Number((await getMeta('governor_id')) || 0);
 
 server.listen(PORT, () => {
   console.log(`🌆 Benin Life server live on port ${PORT} — Day ${day} — db: ${dbMode()} — maps: ${MAPS_KEY ? 'key set' : 'NO KEY (fallback map)'}`);
