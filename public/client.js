@@ -7,13 +7,16 @@
 
 const $ = (id) => document.getElementById(id);
 const SPEED = 0.0011; // degrees/sec (~120 m/s, gamey)
+let speedMult = 1;
 
 let CFG = { mapsKey: '', spawn: { lat: 6.3345, lng: 5.6040 }, bounds: null };
 let ws = null, token = localStorage.getItem('bl_token') || null;
 let myName = localStorage.getItem('bl_name') || null;
 let me = null;
-const players = new Map(); // id -> {id,name,lat,lng,tlat,tlng,housing}
+const players = new Map(); // id -> {id,name,lat,lng,tlat,tlng,housing,gov}
 let ZONES = {}, JOBS = {}, FOOD = {}, FUN = {}, HOUSING = {}, BOUNDS = null;
+let BIZT = {}, VEHT = {};
+let myBiz = null, election = { active: false }, governor = null, unreadDm = 0;
 let day = 1, dayEndsIn = 0, mode = 'login';
 let currentZone = null, manualClose = false;
 let reconnectTimer = null, manualLogout = false;
@@ -104,14 +107,20 @@ async function handle(m) {
     case 'init':
       me = m.you; day = m.day; dayEndsIn = m.endsIn;
       ZONES = m.zones; JOBS = m.jobs; FOOD = m.food; FUN = m.fun; HOUSING = m.housing; BOUNDS = m.bounds;
+      BIZT = m.bizTypes; VEHT = m.vehicles;
+      myBiz = m.biz; election = m.election; governor = m.governor;
+      unreadDm = m.unreadDm || 0;
+      speedMult = m.you.speedMult || 1;
       players.clear();
       for (const p of m.players) players.set(p.id, { ...p, tlat: p.lat, tlng: p.lng });
       $('auth-screen').classList.add('hidden');
       $('game-screen').classList.remove('hidden');
       if (me.is_admin) $('btn-admin').classList.remove('hidden');
       $('chat-msgs').innerHTML = '';
-      for (const c of m.chat) addChat(c.name, c.text, c.name === myName);
+      for (const c of m.chat) addChat(c.name, c.text, c.name === myName, c.gov);
       addSys(`${myName} entered Benin City 🌆`);
+      if (governor) addSys(`👑 ${governor.name} is the Governor of Benin City`);
+      updateDmBadge();
       await initRenderer();
       updateHUD(); startLoop();
       break;
@@ -137,7 +146,7 @@ async function handle(m) {
       break;
     }
     case 'chat':
-      addChat(m.name, m.text, m.name === myName);
+      addChat(m.name, m.text, m.name === myName, m.gov);
       bubbleFor(m.id, m.lat, m.lng, m.text);
       break;
     case 'snap':
@@ -147,10 +156,47 @@ async function handle(m) {
       Object.assign(me, {
         cash: m.cash, energy: m.energy, hunger: m.hunger, happy: m.happy,
         housing: m.housing, cert: m.cert, lat: m.lat, lng: m.lng,
+        vehicle: m.vehicle, savings: m.savings, loan: m.loan, gov: m.gov,
       });
+      if (m.speedMult) speedMult = m.speedMult;
       updateHUD();
       if (m.note) toast(m.note);
       if (!$('zone-panel').classList.contains('hidden') && currentZone) renderZone(currentZone);
+      if (!$('menu-panel').classList.contains('hidden') && menuTab) renderMenuBody();
+      break;
+    case 'biz':
+      myBiz = m.biz;
+      break;
+    case 'election':
+      election = m;
+      if (!$('menu-panel').classList.contains('hidden') && menuTab === 'election') renderMenuBody();
+      break;
+    case 'gov':
+      governor = { id: m.id, name: m.name };
+      if (me) me.gov = (me.id === m.id);
+      for (const p of players.values()) p.gov = (p.id === m.id);
+      if (renderer && renderer.setGov) renderer.setGov(m.id);
+      break;
+    case 'stats':
+      updateOnline(m.online);
+      break;
+    case 'dm':
+      toast(`✉️ ${m.fromName}: ${m.text.slice(0, 60)}`);
+      break;
+    case 'dm_sent':
+      break;
+    case 'dm_unread':
+      unreadDm = m.n;
+      updateDmBadge();
+      break;
+    case 'dm_threads':
+      renderThreads(m.threads);
+      break;
+    case 'dm_history':
+      renderConversation(m.with, m.withName, m.msgs);
+      break;
+    case 'profile':
+      renderProfile(m.p);
       break;
     case 'sys': addSys(m.text); break;
     case 'err': toast('⚠️ ' + m.text); break;
@@ -164,11 +210,11 @@ async function handle(m) {
 // ============================================================
 // CHAT
 // ============================================================
-function addChat(name, text, isMe) {
+function addChat(name, text, isMe, gov) {
   const el = document.createElement('div');
   el.className = 'msg' + (isMe ? ' me' : '');
   const who = document.createElement('span');
-  who.className = 'who'; who.textContent = name + ': ';
+  who.className = 'who'; who.textContent = (gov ? '👑 ' : '') + name + ': ';
   el.appendChild(who);
   el.appendChild(document.createTextNode(text));
   const box = $('chat-msgs');
@@ -199,7 +245,7 @@ function sendChat() {
 }
 $('chat-send').onclick = sendChat;
 $('chat-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') sendChat(); });
-function updateOnline() { $('online-count').textContent = `• ${players.size + 1} online`; }
+function updateOnline(n) { $('online-count').textContent = `• ${n !== undefined ? n : players.size + 1} online`; }
 
 // ============================================================
 // RENDERERS
@@ -278,9 +324,16 @@ class GoogleRenderer {
     if (this.markers.has(p.id)) return;
     const mk = new google.maps.Marker({
       position: { lat: p.lat, lng: p.lng }, map: this.map,
-      icon: dotIcon(colorFor(p.id), isMe), title: p.name,
+      icon: dotIcon(colorFor(p.id), isMe), title: (p.gov ? '👑 ' : '') + p.name,
     });
+    if (!isMe) mk.addListener('click', () => openProfile(p.id));
     this.markers.set(p.id, mk);
+  }
+  setGov(id) {
+    for (const [pid, mk] of this.markers) {
+      const pl = pid === (me && me.id) ? me : players.get(pid);
+      if (pl) mk.setTitle((pid === id ? '👑 ' : '') + (pl.name || pl.username || ''));
+    }
   }
   playerOut(id) {
     const mk = this.markers.get(id);
@@ -318,7 +371,12 @@ class CanvasRenderer {
     this.tapCb = null;
     this.canvas.addEventListener('pointerdown', (e) => {
       const r = this.canvas.getBoundingClientRect();
-      const ll = this.px2ll(e.clientX - r.left, e.clientY - r.top, r.width, r.height);
+      const x = e.clientX - r.left, y = e.clientY - r.top;
+      for (const p of players.values()) {
+        const pp = this.ll2px(p.lat, p.lng, r.width, r.height);
+        if (Math.hypot(pp.x - x, pp.y - y) < 26) { openProfile(p.id); return; }
+      }
+      const ll = this.px2ll(x, y, r.width, r.height);
       if (this.tapCb) this.tapCb(ll.lat, ll.lng);
     });
     this.fit();
@@ -371,7 +429,7 @@ class CanvasRenderer {
       ctx.fillText(z.name, p.x, p.y + 16);
     }
     // players
-    const dot = (lat, lng, color, label, isMe) => {
+    const dot = (lat, lng, color, label, isMe, gov) => {
       const p = P(lat, lng);
       ctx.beginPath(); ctx.arc(p.x, p.y, isMe ? 11 : 9, 0, Math.PI * 2);
       ctx.fillStyle = color; ctx.fill();
@@ -379,9 +437,10 @@ class CanvasRenderer {
       ctx.font = '600 11px sans-serif'; ctx.textAlign = 'center';
       ctx.fillStyle = isMe ? '#22c55e' : '#eef4fa';
       ctx.fillText(label, p.x, p.y - 16);
+      if (gov) { ctx.font = '15px sans-serif'; ctx.fillText('👑', p.x, p.y - 30); }
     };
-    for (const p of players.values()) dot(p.lat, p.lng, colorFor(p.id), p.name, false);
-    if (me) dot(me.lat, me.lng, colorFor(me.id), me.name + ' (you)', true);
+    for (const p of players.values()) dot(p.lat, p.lng, colorFor(p.id), p.name, false, p.gov);
+    if (me) dot(me.lat, me.lng, colorFor(me.id), me.name + ' (you)', true, me.gov);
   }
   project(lat, lng) {
     const r = this.canvas.getBoundingClientRect();
@@ -452,6 +511,7 @@ function startLoop() {
 }
 
 function stepPlayer(dt) {
+  const sp = SPEED * speedMult;
   let dlat = 0, dlng = 0;
   if (keys.up) dlat += 1;
   if (keys.down) dlat -= 1;
@@ -460,14 +520,14 @@ function stepPlayer(dt) {
   if (dlat || dlng) {
     clickTarget = null;
     const n = Math.hypot(dlat, dlng);
-    me.lat = clamp(me.lat + (dlat / n) * SPEED * dt, BOUNDS.latMin, BOUNDS.latMax);
-    me.lng = clamp(me.lng + (dlng / n) * SPEED * dt, BOUNDS.lngMin, BOUNDS.lngMax);
+    me.lat = clamp(me.lat + (dlat / n) * sp * dt, BOUNDS.latMin, BOUNDS.latMax);
+    me.lng = clamp(me.lng + (dlng / n) * sp * dt, BOUNDS.lngMin, BOUNDS.lngMax);
     sendMove();
   } else if (clickTarget) {
     const dM = haversineM(me.lat, me.lng, clickTarget.lat, clickTarget.lng);
     if (dM < 10) { clickTarget = null; }
     else {
-      const stepM = Math.min(dM, SPEED * 111320 * dt);
+      const stepM = Math.min(dM, sp * 111320 * dt);
       const f = stepM / dM;
       me.lat = clamp(me.lat + (clickTarget.lat - me.lat) * f, BOUNDS.latMin, BOUNDS.latMax);
       me.lng = clamp(me.lng + (clickTarget.lng - me.lng) * f, BOUNDS.lngMin, BOUNDS.lngMax);
@@ -648,3 +708,295 @@ if (token && myName) {
   $('username').value = myName;
   connect();
 }
+
+// ============================================================
+// MENU — Bank, Business, Garage, Election, Dice, Street Runs
+// ============================================================
+let menuTab = null;
+const MENU_ITEMS = [
+  ['bank', '🏦', 'Bank'],
+  ['biz', '🏪', 'Business'],
+  ['garage', '🚗', 'Garage'],
+  ['election', '🗳️', 'Election'],
+  ['dice', '🎲', 'Dice'],
+  ['runs', '🏃', 'Street Runs'],
+];
+function esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
+$('btn-menu').onclick = () => openMenu(null);
+$('menu-close').onclick = () => { $('menu-panel').classList.add('hidden'); menuTab = null; };
+
+function openMenu(tab) {
+  menuTab = tab;
+  $('menu-panel').classList.remove('hidden');
+  renderMenuBody();
+}
+function arow() { const d = document.createElement('div'); d.className = 'arow'; return d; }
+function numInput(ph) { const i = document.createElement('input'); i.type = 'number'; i.min = '1'; i.placeholder = ph || 'Amount'; return i; }
+
+function renderMenuBody() {
+  const body = $('menu-body');
+  body.innerHTML = '';
+  if (!menuTab) {
+    $('menu-title').textContent = 'Menu';
+    const grid = document.createElement('div');
+    grid.className = 'menu-grid';
+    for (const [key, icon, label] of MENU_ITEMS) {
+      const b = document.createElement('button');
+      b.className = 'menu-tile';
+      b.innerHTML = `<span class="mt-icon">${icon}</span><span>${label}</span>`;
+      b.onclick = () => openMenu(key);
+      grid.appendChild(b);
+    }
+    if (me.gov) {
+      const gb = document.createElement('button');
+      gb.className = 'menu-tile gov-tile';
+      gb.innerHTML = `<span class="mt-icon">👑</span><span>Governor Broadcast</span>`;
+      gb.onclick = () => openMenu('govbc');
+      grid.appendChild(gb);
+    }
+    body.appendChild(grid);
+    return;
+  }
+  const back = document.createElement('button');
+  back.className = 'go'; back.textContent = '‹ Back'; back.style.marginBottom = '10px';
+  back.onclick = () => openMenu(null);
+  body.appendChild(back);
+  ({ bank: renderBank, biz: renderBizMenu, garage: renderGarage, election: renderElection, dice: renderDice, runs: renderRuns, govbc: renderGovBc }[menuTab] || (() => {}))(body);
+}
+
+function renderBank(body) {
+  $('menu-title').textContent = '🏦 Bank';
+  body.appendChild(section('Your money'));
+  body.appendChild(note(`Cash: ${fmt(me.cash)} • Savings: ${fmt(me.savings)} (2%/day) • Loan: ${fmt(me.loan)} (10%/day)`));
+  body.appendChild(section('Deposit / Withdraw'));
+  let r = arow();
+  const di = numInput('Amount'); const db = document.createElement('button');
+  db.className = 'go'; db.textContent = 'Deposit';
+  db.onclick = () => send({ t: 'act', a: 'bank', op: 'deposit', amount: +di.value });
+  r.appendChild(di); r.appendChild(db); body.appendChild(r);
+  r = arow();
+  const wi = numInput('Amount'); const wb = document.createElement('button');
+  wb.className = 'go'; wb.textContent = 'Withdraw';
+  wb.onclick = () => send({ t: 'act', a: 'bank', op: 'withdraw', amount: +wi.value });
+  r.appendChild(wi); r.appendChild(wb); body.appendChild(r);
+  body.appendChild(section('Loans — up to ₦100,000'));
+  if (me.loan > 0) {
+    body.appendChild(note(`Owing: ${fmt(me.loan)}`));
+    r = arow();
+    const pi = numInput('Repay amount'); const pb = document.createElement('button');
+    pb.className = 'go'; pb.textContent = 'Repay';
+    pb.onclick = () => send({ t: 'act', a: 'repay', amount: +pi.value });
+    r.appendChild(pi); r.appendChild(pb); body.appendChild(r);
+  } else {
+    r = arow();
+    const li = numInput('Loan amount'); const lb = document.createElement('button');
+    lb.className = 'go'; lb.textContent = 'Borrow';
+    lb.onclick = () => send({ t: 'act', a: 'loan', amount: +li.value });
+    r.appendChild(li); r.appendChild(lb); body.appendChild(r);
+  }
+}
+
+function renderBizMenu(body) {
+  $('menu-title').textContent = '🏪 Business';
+  if (myBiz && BIZT[myBiz]) {
+    const b = BIZT[myBiz];
+    body.appendChild(note(`${b.icon} You own a ${b.name} — it earns you ₦${b.income.toLocaleString()} every game day.`));
+  } else {
+    body.appendChild(section('Buy a business — daily income'));
+    for (const [k, b] of Object.entries(BIZT))
+      body.appendChild(row(`${b.icon} ${b.name}`, `₦${b.cost.toLocaleString()} • +₦${b.income.toLocaleString()}/day`, 'Buy',
+        () => send({ t: 'act', a: 'buy_biz', biz: k }), me.cash < b.cost));
+  }
+}
+
+function renderGarage(body) {
+  $('menu-title').textContent = '🚗 Garage';
+  const cur = VEHT[me.vehicle] || VEHT.none;
+  body.appendChild(note(`Current: ${cur.icon} ${cur.name} (${speedMult}x speed)`));
+  body.appendChild(section('Buy a ride — move faster'));
+  for (const [k, v] of Object.entries(VEHT)) {
+    if (k === 'none') continue;
+    const owned = me.vehicle === k;
+    body.appendChild(row(`${v.icon} ${v.name}`, `₦${v.cost.toLocaleString()} • ${v.mult}x speed`, owned ? '✓' : 'Buy',
+      () => send({ t: 'act', a: 'buy_vehicle', v: k }), owned || me.cash < v.cost));
+  }
+}
+
+function renderElection(body) {
+  $('menu-title').textContent = '🗳️ Election';
+  if (governor) body.appendChild(note(`👑 Current Governor: ${governor.name} (salary ₦25,000/day, daily city broadcast)`));
+  if (!election.active) { body.appendChild(note('No election running right now.')); return; }
+  body.appendChild(note(`Race ends in ~${election.endsInDays} game day(s). ${election.voted ? 'You have voted ✓' : 'You have not voted yet.'}`));
+  body.appendChild(section('Candidates'));
+  if (!election.candidates.length) body.appendChild(note('No candidates yet. Be the first!'));
+  for (const c of election.candidates) {
+    const isGov = governor && Number(c.player_id) === governor.id;
+    body.appendChild(row(`${isGov ? '👑 ' : ''}${c.username}`, `${c.votes} vote(s)`,
+      election.voted ? '🗳' : 'Vote',
+      () => send({ t: 'act', a: 'vote', candidate: c.player_id }), election.voted));
+  }
+  body.appendChild(section('Run for Governor'));
+  if (election.running) body.appendChild(note('You are on the ballot! Campaign in the city chat.'));
+  else body.appendChild(row('Join the race', '₦50,000 campaign fee', 'Run',
+    () => { if (confirm('Pay ₦50,000 campaign fee to run for Governor?')) send({ t: 'act', a: 'run' }); },
+    me.cash < 50000));
+}
+
+let dicePick = 0;
+function renderDice(body) {
+  $('menu-title').textContent = '🎲 Dice';
+  body.appendChild(note('Pick 1–6. Roll your number, win 5x your stake! Stake: ₦100 – ₦10,000.'));
+  const picks = document.createElement('div'); picks.className = 'dice-picks';
+  for (let i = 1; i <= 6; i++) {
+    const b = document.createElement('button');
+    b.className = 'dice-btn' + (dicePick === i ? ' sel' : '');
+    b.textContent = i;
+    b.onclick = () => { dicePick = i; renderMenuBody(); };
+    picks.appendChild(b);
+  }
+  body.appendChild(picks);
+  const r = arow();
+  const inp = numInput('Stake'); inp.value = 500;
+  const go = document.createElement('button'); go.className = 'go'; go.textContent = 'Roll 🎲';
+  go.onclick = () => {
+    if (!dicePick) return toast('Pick a number first!');
+    send({ t: 'act', a: 'bet', amount: +inp.value, pick: dicePick });
+  };
+  r.appendChild(inp); r.appendChild(go); body.appendChild(r);
+}
+
+function renderRuns(body) {
+  $('menu-title').textContent = '🏃 Street Runs';
+  body.appendChild(note('Risky street hustle. 60% chance you score ₦3k–₦8k. Sometimes police dodge am, sometimes wahala: ₦10,000 "bail" or 3 minutes detention. Cooldown 2 min.'));
+  const b = document.createElement('button'); b.className = 'primary'; b.textContent = 'Do street runs 🏃';
+  b.style.marginTop = '10px';
+  b.onclick = () => send({ t: 'act', a: 'runs' });
+  body.appendChild(b);
+}
+
+function renderGovBc(body) {
+  $('menu-title').textContent = '👑 Governor Broadcast';
+  body.appendChild(note('As Governor, your word carries weight. Address the city (once per day):'));
+  const r = arow();
+  const inp = document.createElement('input'); inp.placeholder = 'Announcement…'; inp.maxLength = 200;
+  const go = document.createElement('button'); go.className = 'go'; go.textContent = 'Send';
+  go.onclick = () => { if (inp.value.trim()) { send({ t: 'act', a: 'gov_broadcast', text: inp.value }); inp.value = ''; } };
+  r.appendChild(inp); r.appendChild(go); body.appendChild(r);
+}
+
+// ============================================================
+// DMS
+// ============================================================
+let dmWith = null, dmWithName = '';
+$('btn-dm').onclick = () => { $('dm-panel').classList.remove('hidden'); dmWith = null; send({ t: 'dm_threads' }); };
+$('dm-close').onclick = () => $('dm-panel').classList.add('hidden');
+$('dm-back').onclick = () => { dmWith = null; send({ t: 'dm_threads' }); };
+
+function updateDmBadge() {
+  const b = $('dm-badge');
+  if (unreadDm > 0) { b.textContent = unreadDm > 9 ? '9+' : unreadDm; b.classList.remove('hidden'); }
+  else b.classList.add('hidden');
+}
+
+function renderThreads(threads) {
+  dmWith = null;
+  $('dm-back').classList.add('hidden');
+  const body = $('dm-body'); body.innerHTML = '';
+  if (!threads.length) body.appendChild(note('No messages yet. Tap any player on the map to message them.'));
+  for (const th of threads) {
+    const d = document.createElement('div'); d.className = 'dm-thread';
+    const b = document.createElement('b'); b.textContent = th.username;
+    const prev = document.createElement('span'); prev.className = 'dm-prev'; prev.textContent = th.last_text || '';
+    d.appendChild(b); d.appendChild(document.createTextNode(' ')); d.appendChild(prev);
+    if (th.unread > 0) {
+      const tag = document.createElement('span'); tag.className = 'tag on'; tag.textContent = th.unread + ' new';
+      d.appendChild(document.createTextNode(' ')); d.appendChild(tag);
+    }
+    d.onclick = () => { dmWith = th.pid; dmWithName = th.username; send({ t: 'dm_history', with: th.pid }); };
+    body.appendChild(d);
+  }
+}
+
+function renderConversation(withId, withName, msgs) {
+  $('dm-back').classList.remove('hidden');
+  const body = $('dm-body'); body.innerHTML = '';
+  const box = document.createElement('div'); box.id = 'dm-conv';
+  for (const m of msgs) {
+    const d = document.createElement('div');
+    d.className = 'msg' + (m.from_id === me.id ? ' me' : '');
+    d.appendChild(document.createTextNode(m.text));
+    box.appendChild(d);
+  }
+  body.appendChild(box);
+  box.scrollTop = box.scrollHeight;
+  const r = arow();
+  const inp = document.createElement('input'); inp.placeholder = `Message ${withName}…`; inp.maxLength = 200;
+  const go = document.createElement('button'); go.className = 'go'; go.textContent = '➤';
+  const sendDm = () => {
+    const t = inp.value.trim(); if (!t) return;
+    send({ t: 'dm', to: withId, text: t });
+    const d = document.createElement('div'); d.className = 'msg me'; d.textContent = t;
+    box.appendChild(d); box.scrollTop = box.scrollHeight; inp.value = '';
+  };
+  go.onclick = sendDm;
+  inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendDm(); });
+  r.appendChild(inp); r.appendChild(go); body.appendChild(r);
+  send({ t: 'dm_read' });
+}
+
+// ============================================================
+// PROFILES
+// ============================================================
+function openProfile(id) {
+  send({ t: 'profile', id });
+  $('profile-modal').classList.remove('hidden');
+  $('profile-title').textContent = '👤';
+  $('profile-body').innerHTML = '<p style="color:#93a5b8">Loading…</p>';
+}
+$('profile-close').onclick = () => $('profile-modal').classList.add('hidden');
+
+function renderProfile(p) {
+  $('profile-title').textContent = (p.gov ? '👑 ' : '') + p.username;
+  const body = $('profile-body'); body.innerHTML = '';
+  const v = (VEHT && VEHT[p.vehicle]) || { icon: '🚶', name: 'On foot' };
+  const rows = [
+    ['Status', p.online ? '🟢 online' : '⚫ offline'],
+    ['Cash', fmt(p.cash)],
+    ['Housing', ((HOUSING || {})[p.housing] || {}).name || p.housing],
+    ['Vehicle', `${v.icon} ${v.name}`],
+    ['Business', p.biz && BIZT[p.biz] ? `${BIZT[p.biz].icon} ${BIZT[p.biz].name}` : '—'],
+    ['Education', p.cert ? '🎓 Certified' : '—'],
+  ];
+  for (const [k, val] of rows) {
+    const d = document.createElement('div'); d.className = 'prof-row';
+    const s = document.createElement('span'); s.textContent = k;
+    const b = document.createElement('b'); b.textContent = val;
+    d.appendChild(s); d.appendChild(b); body.appendChild(d);
+  }
+  if (p.id !== me.id) {
+    const b = document.createElement('button'); b.className = 'primary';
+    b.style.marginTop = '12px'; b.textContent = `✉️ Message ${p.username}`;
+    b.onclick = () => {
+      $('profile-modal').classList.add('hidden');
+      $('dm-panel').classList.remove('hidden');
+      dmWith = p.id; dmWithName = p.username;
+      send({ t: 'dm_history', with: p.id });
+    };
+    body.appendChild(b);
+  }
+}
+
+// ============================================================
+// LIVE COUNTERS on the auth screen
+// ============================================================
+async function loadStats() {
+  try {
+    const r = await fetch('/api/stats');
+    const s = await r.json();
+    $('live-counts').textContent =
+      `🟢 ${s.online} online now • 👥 ${(s.visits || 0).toLocaleString()} visits` +
+      (s.governor ? ` • 👑 Gov ${s.governor}` : '');
+  } catch {}
+}
+loadStats();
+setInterval(loadStats, 30000);
