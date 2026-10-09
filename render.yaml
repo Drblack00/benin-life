@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: benin-life
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: NODE_VERSION
+        value: 22
