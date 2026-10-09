@@ -306,6 +306,51 @@ let dayStart = Date.now();
 let election = null;
 let governorId = 0;
 
+// ---------------- Street finds (Pokémon-GO-style spawns) ----------------
+const spawns = new Map(); // id -> {id,lat,lng,kind,icon,amount,expires}
+let spawnSeq = 1;
+const SPAWN_KINDS = [
+  { kind: 'cash', icon: '💵', w: 50 },
+  { kind: 'snack', icon: '🍲', w: 25 },
+  { kind: 'energy', icon: '🥤', w: 25 },
+];
+function pickSpawnKind() {
+  let r = Math.random() * 100, acc = 0;
+  for (const k of SPAWN_KINDS) { acc += k.w; if (r < acc) return k; }
+  return SPAWN_KINDS[0];
+}
+function spawnTick() {
+  const now = Date.now();
+  for (const [id, s] of spawns) {
+    if (s.expires < now) { spawns.delete(id); broadcast({ t: 'despawn', id }); }
+  }
+  if (spawns.size > 80) return;
+  for (const o of online.values()) {
+    const p = o.p;
+    let near = 0;
+    for (const s of spawns.values()) if (haversineM(p.lat, p.lng, s.lat, s.lng) < 800) near++;
+    if (near >= 4) continue;
+    const n = Math.random() < 0.5 ? 1 : 2;
+    for (let i = 0; i < n; i++) {
+      const ang = Math.random() * Math.PI * 2;
+      const dist = 150 + Math.random() * 450; // meters from player
+      const lat = p.lat + (dist * Math.cos(ang)) / 110540;
+      const lng = p.lng + (dist * Math.sin(ang)) / (111320 * Math.cos(p.lat * Math.PI / 180));
+      if (!inBounds(lat, lng)) continue;
+      const kind = pickSpawnKind();
+      const s = {
+        id: spawnSeq++,
+        lat: +lat.toFixed(6), lng: +lng.toFixed(6),
+        kind: kind.kind, icon: kind.icon,
+        amount: kind.kind === 'cash' ? 300 + Math.floor(Math.random() * 1200) : 0,
+        expires: now + 180000,
+      };
+      spawns.set(s.id, s);
+      broadcast({ t: 'spawn', s });
+    }
+  }
+}
+
 function pub(p) {
   return { id: p.id, name: p.username, lat: p.lat, lng: p.lng, housing: p.housing, gov: p.id === governorId };
 }
@@ -708,9 +753,11 @@ wss.on('connection', async (ws, req) => {
     governor: govRow ? { id: govRow.id, name: govRow.username } : null,
     unreadDm: await unreadDmCount(id),
     visits,
+    spawns: [...spawns.values()],
   });
   broadcast({ t: 'join', p: pub(o.p) }, id);
   broadcast({ t: 'stats', online: online.size });
+  setTimeout(() => { try { spawnTick(); } catch (e) { console.error('[spawn]', e.message); } }, 1500);
 
   ws.on('message', async (raw) => {
     let m;
@@ -776,6 +823,24 @@ wss.on('connection', async (ws, req) => {
       await markDmRead(o.p.id, now);
       send(o, { t: 'dm_unread', n: 0 });
     }
+    else if (m.t === 'collect') {
+      const p = o.p;
+      const s = spawns.get(Number(m.id));
+      if (!s) return;
+      if (Date.now() > s.expires) { spawns.delete(s.id); return; }
+      if (haversineM(p.lat, p.lng, s.lat, s.lng) > 300) {
+        sys(o, '📍 Too far — walk closer to grab it!');
+        return;
+      }
+      spawns.delete(s.id);
+      let msg;
+      if (s.kind === 'cash') { p.cash += s.amount; msg = `💵 Street find! +₦${s.amount.toLocaleString()}`; }
+      else if (s.kind === 'snack') { p.hunger = clamp(p.hunger + 25, 0, 100); msg = '🍲 Tasty street find! Hunger +25'; }
+      else { p.energy = clamp(p.energy + 25, 0, 100); msg = '🥤 Cold drink! Energy +25'; }
+      await persist(o);
+      pushYou(o, msg);
+      broadcast({ t: 'despawn', id: s.id });
+    }
     else if (m.t === 'profile') {
       const tp = await getPlayerById(Number(m.id));
       if (!tp) return;
@@ -831,6 +896,8 @@ setInterval(() => {
 }, 60000);
 
 setInterval(() => { for (const o of online.values()) persist(o).catch(e => console.error('[save]', e.message)); }, SAVE_MS);
+setInterval(spawnTick, 45000);
+setTimeout(spawnTick, 5000);
 
 // ---------------- Boot ----------------
 election = await currentElection();
