@@ -31,6 +31,9 @@ import {
   addCandidate, listCandidates, hasVoted, castVote, topCandidate,
   addDm, dmThreads, dmHistory, unreadDmCount, markDmRead,
   getMeta, setMeta, bumpVisits,
+  addFriendRequest, respondFriendRequest, removeFriend, listFriendships, areFriends,
+  createRoom, listRooms, getRoom, deleteRoom, joinRoom, leaveRoom, roomMembers,
+  roomMemberRole, setRoomMuted, playerRooms,
 } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -309,7 +312,66 @@ let governorId = 0;
 // ---------------- Street finds (Pokémon-GO-style spawns) ----------------
 const spawns = new Map(); // id -> {id,lat,lng,kind,icon,amount,expires}
 let spawnSeq = 1;
-const SPAWN_KINDS = [
+
+// ---------------- Social: friends, rooms, mentions ----------------
+const roomChats = new Map(); // roomId -> [{name,text,ts,gov}] (last 50)
+const roomRead = new Map();  // `${pid}:${roomId}` -> ts last read
+const PRESET_ROOMS = [
+  { name: 'Hustle Talk', topic: 'Money moves & business gist', icon: '💼' },
+  { name: 'Market Deals', topic: 'Buy & sell with players', icon: '🛒' },
+  { name: 'Governance', topic: 'Elections, laws & city talk', icon: '🗳️' },
+  { name: 'Street Gist', topic: 'Bants, vibes & randomness', icon: '🎲' },
+];
+async function seedRooms() {
+  const existing = await listRooms();
+  if (existing.length) return;
+  for (const r of PRESET_ROOMS) await createRoom(r.name, r.topic, r.icon, 0);
+  console.log('[rooms] seeded preset rooms');
+}
+function sendTo(pid, msg) {
+  const o = online.get(pid);
+  if (o && o.ws.readyState === 1) o.ws.send(JSON.stringify(msg));
+}
+// friends list enriched with live presence + location for the client
+async function friendsFor(pid) {
+  const list = await listFriendships(pid);
+  return list.map(f => {
+    const o = online.get(f.other_id);
+    return { ...f, online: !!o, lat: o ? o.p.lat : null, lng: o ? o.p.lng : null };
+  });
+}
+function roomHistory(roomId) {
+  if (!roomChats.has(roomId)) roomChats.set(roomId, []);
+  return roomChats.get(roomId);
+}
+async function roomListFor(pid) {
+  const rooms = await listRooms();
+  const mine = new Set(await playerRooms(pid));
+  return Promise.all(rooms.map(async (r) => {
+    const hist = roomHistory(r.id);
+    const readTs = roomRead.get(`${pid}:${r.id}`) || 0;
+    const unread = hist.filter(m => m.ts > readTs && m.name !== online.get(pid)?.p.username).length;
+    return { ...r, members: Number(r.members), joined: mine.has(Number(r.id)), unread };
+  }));
+}
+function notifyMentions(text, fromName, where) {  // where: {kind:'city'} or {kind:'room', roomId, roomName}
+  const seen = new Set();
+  for (const m of text.matchAll(/@([A-Za-z0-9_]{3,20})/g)) {
+    const uname = m[1].toLowerCase();
+    if (seen.has(uname)) continue;
+    seen.add(uname);
+    for (const o of online.values()) {
+      if (o.p.username.toLowerCase() === uname && o.p.username !== fromName) {
+        sendTo(o.p.id, {
+          t: 'mention', from: fromName,
+          where: where.kind === 'room' ? `room:${where.roomId}` : 'city',
+          roomName: where.roomName || null,
+          text: text.slice(0, 80),
+        });
+      }
+    }
+  }
+}const SPAWN_KINDS = [
   { kind: 'cash', icon: '💵', w: 50 },
   { kind: 'snack', icon: '🍲', w: 25 },
   { kind: 'energy', icon: '🥤', w: 25 },
@@ -397,6 +459,17 @@ async function tallyElection(forced) {
   }
   election = await createElection(day, day + ELECTION_DAYS);
   broadcast({ t: 'election', ...(await electionState(null)) });
+  // close campaign rooms from the finished race
+  try {
+    const rooms = await listRooms();
+    for (const r of rooms) {
+      if (Number(r.creator_id) !== 0 && r.icon === '📣' && /'s Campaign$/.test(r.name)) {
+        await deleteRoom(Number(r.id));
+        roomChats.delete(Number(r.id));
+      }
+    }
+    for (const oid of online.keys()) sendTo(oid, { t: 'rooms', rooms: await roomListFor(oid) });
+  } catch (e) { console.error('[campaign cleanup]', e.message); }
   console.log(`[election] #${el.id} closed, winner=${winnerId || 'none'}`);
 }
 
@@ -506,6 +579,13 @@ async function doAct(o, m) {
     await persist(o);
     pushYou(o, `🗳️ You're on the ballot! Campaign across the city.`);
     broadcast({ t: 'sys', text: `🗳️ ${p.username} is running for Governor!` });
+    // campaign room for this candidate
+    try {
+      const campId = await createRoom(`${p.username}'s Campaign`, `Campaign HQ — vote ${p.username} for Governor!`, '📣', p.id);
+      await joinRoom(campId, p.id, 'owner');
+      roomRead.set(`${p.id}:${campId}`, Date.now());
+      for (const oid of online.keys()) sendTo(oid, { t: 'rooms', rooms: await roomListFor(oid) });
+    } catch (e) { console.error('[campaign room]', e.message); }
   }
   else if (m.a === 'vote') {
     const el = await currentElection();
@@ -754,6 +834,8 @@ wss.on('connection', async (ws, req) => {
     unreadDm: await unreadDmCount(id),
     visits,
     spawns: [...spawns.values()],
+    friends: await friendsFor(id),
+    rooms: await roomListFor(id),
   });
   broadcast({ t: 'join', p: pub(o.p) }, id);
   broadcast({ t: 'stats', online: online.size });
@@ -791,6 +873,7 @@ wss.on('connection', async (ws, req) => {
       if (chatMemory.length > 60) chatMemory = chatMemory.slice(-60);
       await addChat(o.p.username, text, now).catch(e => console.error('[chat]', e.message));
       broadcast({ t: 'chat', id, ...entry, lat: o.p.lat, lng: o.p.lng });
+      notifyMentions(text, o.p.username, { kind: 'city' });
     }
     else if (m.t === 'act') {
       await doAct(o, m).catch(e => { console.error('[act]', e.message); sys(o, 'Something went wrong, try again.'); });
@@ -855,6 +938,148 @@ wss.on('connection', async (ws, req) => {
         },
       });
     }
+    // ---------------- Friends ----------------
+    else if (m.t === 'friend_add') {
+      const uname = String(m.username || '').trim();
+      if (!uname) return;
+      const target = await getPlayerByName(uname);
+      if (!target) return sys(o, `No player named "${uname}".`);
+      const res = await addFriendRequest(id, target.id);
+      if (res === 'self') return sys(o, 'You cannot add yourself.');
+      if (res === 'exists') return sys(o, 'Already friends or request pending.');
+      if (res === 'accepted') {
+        sys(o, `🤝 You and ${target.username} are now friends!`);
+        sendTo(target.id, { t: 'sys', text: `🤝 You and ${o.p.username} are now friends!` });
+        sendTo(target.id, { t: 'friends', friends: await friendsFor(target.id) });
+      } else {
+        sys(o, `🤝 Friend request sent to ${target.username}.`);
+        sendTo(target.id, {
+          t: 'friend_request',
+          from: { id: o.p.id, username: o.p.username },
+          friends: await friendsFor(target.id),
+        });
+      }
+      send(o, { t: 'friends', friends: await friendsFor(id) });
+    }
+    else if (m.t === 'friend_accept' || m.t === 'friend_decline') {
+      const otherId = Number(m.playerId);
+      const ok = await respondFriendRequest(id, otherId, m.t === 'friend_accept');
+      if (!ok) return sys(o, 'No such request.');
+      const other = await getPlayerById(otherId);
+      const uname = other ? other.username : 'them';
+      sys(o, m.t === 'friend_accept' ? `🤝 You are now friends with ${uname}!` : `Request from ${uname} declined.`);
+      sendTo(otherId, {
+        t: 'sys',
+        text: m.t === 'friend_accept' ? `🤝 ${o.p.username} accepted your friend request!` : `😶 ${o.p.username} declined your friend request.`,
+      });
+      sendTo(otherId, { t: 'friends', friends: await friendsFor(otherId) });
+      send(o, { t: 'friends', friends: await friendsFor(id) });
+    }
+    else if (m.t === 'friend_remove') {
+      const otherId = Number(m.playerId);
+      await removeFriend(id, otherId);
+      send(o, { t: 'friends', friends: await friendsFor(id) });
+      sendTo(otherId, { t: 'friends', friends: await friendsFor(otherId) });
+      sys(o, 'Friend removed.');
+    }
+    else if (m.t === 'friends') {
+      send(o, { t: 'friends', friends: await friendsFor(id) });
+    }
+    // ---------------- Rooms ----------------
+    else if (m.t === 'rooms') {
+      send(o, { t: 'rooms', rooms: await roomListFor(id) });
+    }
+    else if (m.t === 'create_room') {
+      const name = clean(m.name).slice(0, 30);
+      if (!name) return sys(o, 'Give the room a name.');
+      const topic = clean(m.topic).slice(0, 80);
+      const icon = String(m.icon || '💬').slice(0, 4);
+      const roomId = await createRoom(name, topic, icon, id);
+      await joinRoom(roomId, id, 'owner');
+      roomRead.set(`${id}:${roomId}`, Date.now());
+      for (const oid of online.keys()) sendTo(oid, { t: 'rooms', rooms: await roomListFor(oid) });
+      send(o, { t: 'room_joined', roomId });
+    }
+    else if (m.t === 'join_room') {
+      const roomId = Number(m.roomId);
+      const room = await getRoom(roomId);
+      if (!room) return sys(o, 'Room not found.');
+      await joinRoom(roomId, id, 'member');
+      roomRead.set(`${id}:${roomId}`, Date.now());
+      send(o, { t: 'room_joined', roomId, history: roomHistory(roomId).slice(-50) });
+      for (const oid of online.keys()) sendTo(oid, { t: 'rooms', rooms: await roomListFor(oid) });
+    }
+    else if (m.t === 'leave_room') {
+      const roomId = Number(m.roomId);
+      await leaveRoom(roomId, id);
+      send(o, { t: 'room_left', roomId });
+      for (const oid of online.keys()) sendTo(oid, { t: 'rooms', rooms: await roomListFor(oid) });
+    }
+    else if (m.t === 'room_chat') {
+      const roomId = Number(m.roomId);
+      const mem = await roomMemberRole(roomId, id);
+      if (!mem) return sys(o, 'Join the room first.');
+      if (Date.now() < mem.muted_until) return sys(o, '🔇 You are muted in this room.');
+      if (now - o.lastChat < 1200) return send(o, { t: 'err', text: 'Slow down on the chat.' });
+      o.lastChat = now;
+      const text = clean(m.text);
+      if (!text) return;
+      const room = await getRoom(roomId);
+      const entry = { name: o.p.username, text, ts: now, gov: o.p.id === governorId };
+      const hist = roomHistory(roomId);
+      hist.push(entry);
+      if (hist.length > 50) hist.splice(0, hist.length - 50);
+      const members = await roomMembers(roomId);
+      for (const mb of members) {
+        const mo = online.get(mb.player_id);
+        if (mo && mo.ws.readyState === 1) {
+          send(mo, { t: 'room_msg', roomId, ...entry });
+          if (mb.player_id !== id) {
+            const unread = hist.filter(x => x.ts > (roomRead.get(`${mb.player_id}:${roomId}`) || 0) && x.name !== mo.p.username).length;
+            send(mo, { t: 'room_unread', roomId, unread });
+          }
+        }
+      }
+      notifyMentions(text, o.p.username, { kind: 'room', roomId, roomName: room ? room.name : '' });
+    }
+    else if (m.t === 'room_members') {
+      const roomId = Number(m.roomId);
+      const mem = await roomMemberRole(roomId, id);
+      if (!mem) return;
+      const members = await roomMembers(roomId);
+      send(o, {
+        t: 'room_members', roomId,
+        members: members.map(x => ({ ...x, online: online.has(x.player_id) })),
+      });
+    }
+    else if (m.t === 'room_read') {
+      roomRead.set(`${id}:${Number(m.roomId)}`, Date.now());
+    }
+    else if (m.t === 'kick_room' || m.t === 'mute_room') {
+      const roomId = Number(m.roomId);
+      const targetId = Number(m.playerId);
+      const mem = await roomMemberRole(roomId, id);
+      const room = await getRoom(roomId);
+      const isAdmin = !!o.p.is_admin;
+      if (!mem || (mem.role !== 'owner' && !isAdmin)) return sys(o, 'Only the room owner can do that.');
+      if (targetId === id) return sys(o, 'You cannot moderate yourself.');
+      if (m.t === 'kick_room') {
+        await leaveRoom(roomId, targetId);
+        sendTo(targetId, { t: 'sys', text: `👢 You were kicked from "${room ? room.name : 'a room'}".` });
+        sendTo(targetId, { t: 'room_left', roomId });
+        sys(o, 'Member kicked.');
+      } else {
+        const mins = Math.max(1, Math.min(1440, Number(m.minutes) || 10));
+        await setRoomMuted(roomId, targetId, Date.now() + mins * 60000);
+        sendTo(targetId, { t: 'sys', text: `🔇 You are muted in "${room ? room.name : 'a room'}" for ${mins}m.` });
+        sys(o, `Muted for ${mins}m.`);
+      }
+      const members = await roomMembers(roomId);
+      for (const mb of members) sendTo(mb.player_id, {
+        t: 'room_members', roomId,
+        members: members.map(x => ({ ...x, online: online.has(x.player_id) })),
+      });
+    }
   });
 
   ws.on('close', () => {
@@ -903,6 +1128,7 @@ setTimeout(spawnTick, 5000);
 election = await currentElection();
 if (!election) election = await createElection(1, 1 + ELECTION_DAYS);
 governorId = Number((await getMeta('governor_id')) || 0);
+await seedRooms().catch(e => console.error('[rooms]', e.message));
 
 server.listen(PORT, () => {
   console.log(`🌆 Benin Life server live on port ${PORT} — Day ${day} — db: ${dbMode()} — maps: ${MAPS_KEY ? 'key set' : 'NO KEY (fallback map)'}`);

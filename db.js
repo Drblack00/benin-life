@@ -82,6 +82,30 @@ CREATE TABLE IF NOT EXISTS dms (
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS friendships (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  requester_id INTEGER NOT NULL,
+  addressee_id INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_ts INTEGER NOT NULL,
+  UNIQUE(requester_id, addressee_id)
+);
+CREATE TABLE IF NOT EXISTS rooms (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  topic TEXT NOT NULL DEFAULT '',
+  icon TEXT NOT NULL DEFAULT '💬',
+  creator_id INTEGER NOT NULL DEFAULT 0,
+  created_ts INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS room_members (
+  room_id INTEGER NOT NULL,
+  player_id INTEGER NOT NULL,
+  role TEXT NOT NULL DEFAULT 'member',
+  muted_until INTEGER NOT NULL DEFAULT 0,
+  joined_ts INTEGER NOT NULL,
+  PRIMARY KEY (room_id, player_id)
 );`;
 
 const PG_SCHEMA = `
@@ -147,6 +171,30 @@ CREATE TABLE IF NOT EXISTS dms (
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS friendships (
+  id SERIAL PRIMARY KEY,
+  requester_id INTEGER NOT NULL,
+  addressee_id INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_ts BIGINT NOT NULL,
+  UNIQUE(requester_id, addressee_id)
+);
+CREATE TABLE IF NOT EXISTS rooms (
+  id SERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  topic TEXT NOT NULL DEFAULT '',
+  icon TEXT NOT NULL DEFAULT '💬',
+  creator_id INTEGER NOT NULL DEFAULT 0,
+  created_ts BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS room_members (
+  room_id INTEGER NOT NULL,
+  player_id INTEGER NOT NULL,
+  role TEXT NOT NULL DEFAULT 'member',
+  muted_until BIGINT NOT NULL DEFAULT 0,
+  joined_ts BIGINT NOT NULL,
+  PRIMARY KEY (room_id, player_id)
 );`;
 
 // ---------- low-level helpers (same API, both backends) ----------
@@ -468,4 +516,141 @@ export async function bumpVisits() {
   const v = Number((await getMeta('visits')) || 0) + 1;
   await setMeta('visits', v);
   return v;
+}
+
+// ---------------- Friends ----------------
+export async function addFriendRequest(requesterId, addresseeId) {
+  if (requesterId === addresseeId) return 'self';
+  const existing = await getOne(
+    'SELECT * FROM friendships WHERE (requester_id=? AND addressee_id=?) OR (requester_id=? AND addressee_id=?)',
+    'SELECT * FROM friendships WHERE (requester_id=$1 AND addressee_id=$2) OR (requester_id=$3 AND addressee_id=$4)',
+    [requesterId, addresseeId, addresseeId, requesterId]);
+  if (existing) {
+    // they already requested us -> auto-accept
+    if (existing.status === 'pending' && Number(existing.requester_id) === addresseeId) {
+      await runQ('UPDATE friendships SET status=? WHERE id=?', 'UPDATE friendships SET status=$1 WHERE id=$2', ['accepted', existing.id]);
+      return 'accepted';
+    }
+    return 'exists';
+  }
+  const now = Date.now();
+  await runQ(
+    'INSERT INTO friendships (requester_id, addressee_id, status, created_ts) VALUES (?,?,?,?)',
+    'INSERT INTO friendships (requester_id, addressee_id, status, created_ts) VALUES ($1,$2,$3,$4)',
+    [requesterId, addresseeId, 'pending', now]);
+  return 'ok';
+}
+export async function respondFriendRequest(addresseeId, requesterId, accept) {
+  const r = await getOne(
+    'SELECT * FROM friendships WHERE requester_id=? AND addressee_id=? AND status=?',
+    'SELECT * FROM friendships WHERE requester_id=$1 AND addressee_id=$2 AND status=$3',
+    [requesterId, addresseeId, 'pending']);
+  if (!r) return false;
+  await runQ('UPDATE friendships SET status=? WHERE id=?', 'UPDATE friendships SET status=$1 WHERE id=$2',
+    [accept ? 'accepted' : 'declined', r.id]);
+  return true;
+}
+export async function removeFriend(a, b) {
+  await runQ(
+    'DELETE FROM friendships WHERE (requester_id=? AND addressee_id=?) OR (requester_id=? AND addressee_id=?)',
+    'DELETE FROM friendships WHERE (requester_id=$1 AND addressee_id=$2) OR (requester_id=$3 AND addressee_id=$4)',
+    [a, b, b, a]);
+}
+export async function listFriendships(playerId) {
+  const rows = await getAll(
+    `SELECT f.id, f.requester_id, f.addressee_id, f.status, f.created_ts, p.username AS other_username
+     FROM friendships f JOIN players p
+       ON p.id = CASE WHEN f.requester_id=? THEN f.addressee_id ELSE f.requester_id END
+     WHERE (f.requester_id=? OR f.addressee_id=?) AND f.status IN ('pending','accepted')
+     ORDER BY f.created_ts DESC`,
+    `SELECT f.id, f.requester_id, f.addressee_id, f.status, f.created_ts, p.username AS other_username
+     FROM friendships f JOIN players p
+       ON p.id = CASE WHEN f.requester_id=$1 THEN f.addressee_id ELSE f.requester_id END
+     WHERE (f.requester_id=$1 OR f.addressee_id=$1) AND f.status IN ('pending','accepted')
+     ORDER BY f.created_ts DESC`,
+    [playerId, playerId, playerId]);
+  return rows.map(r => ({
+    id: Number(r.id),
+    other_id: Number(r.requester_id) === Number(playerId) ? Number(r.addressee_id) : Number(r.requester_id),
+    other_username: r.other_username,
+    status: r.status,
+    incoming: r.status === 'pending' && Number(r.addressee_id) === Number(playerId),
+    created_ts: Number(r.created_ts),
+  }));
+}
+export async function areFriends(a, b) {
+  const r = await getOne(
+    `SELECT 1 AS x FROM friendships WHERE status='accepted' AND
+     ((requester_id=? AND addressee_id=?) OR (requester_id=? AND addressee_id=?))`,
+    `SELECT 1 AS x FROM friendships WHERE status='accepted' AND
+     ((requester_id=$1 AND addressee_id=$2) OR (requester_id=$3 AND addressee_id=$4))`,
+    [a, b, b, a]);
+  return !!r;
+}
+
+// ---------------- Rooms ----------------
+export async function createRoom(name, topic, icon, creatorId) {
+  const now = Date.now();
+  if (pool) {
+    const r = await pool.query(
+      'INSERT INTO rooms (name, topic, icon, creator_id, created_ts) VALUES ($1,$2,$3,$4,$5) RETURNING id',
+      [name, topic || '', icon || '💬', creatorId, now]);
+    return Number(r.rows[0].id);
+  }
+  const r = sdb.prepare('INSERT INTO rooms (name, topic, icon, creator_id, created_ts) VALUES (?,?,?,?,?)')
+    .run(name, topic || '', icon || '💬', creatorId, now);
+  return Number(r.lastInsertRowid);
+}
+export async function listRooms() {
+  return getAll(
+    `SELECT r.id, r.name, r.topic, r.icon, r.creator_id, COUNT(m.player_id) AS members
+     FROM rooms r LEFT JOIN room_members m ON m.room_id = r.id
+     GROUP BY r.id, r.name, r.topic, r.icon, r.creator_id ORDER BY r.id`,
+    `SELECT r.id, r.name, r.topic, r.icon, r.creator_id, COUNT(m.player_id) AS members
+     FROM rooms r LEFT JOIN room_members m ON m.room_id = r.id
+     GROUP BY r.id, r.name, r.topic, r.icon, r.creator_id ORDER BY r.id`,
+    []);
+}
+export async function getRoom(id) {
+  return getOne('SELECT * FROM rooms WHERE id=?', 'SELECT * FROM rooms WHERE id=$1', [id]);
+}
+export async function deleteRoom(id) {
+  await runQ('DELETE FROM room_members WHERE room_id=?', 'DELETE FROM room_members WHERE room_id=$1', [id]);
+  await runQ('DELETE FROM rooms WHERE id=?', 'DELETE FROM rooms WHERE id=$1', [id]);
+}
+export async function joinRoom(roomId, playerId, role) {
+  const now = Date.now();
+  await runQ(
+    `INSERT INTO room_members (room_id, player_id, role, muted_until, joined_ts) VALUES (?,?,?,?,?)
+     ON CONFLICT(room_id, player_id) DO NOTHING`,
+    `INSERT INTO room_members (room_id, player_id, role, muted_until, joined_ts) VALUES ($1,$2,$3,$4,$5)
+     ON CONFLICT(room_id, player_id) DO NOTHING`,
+    [roomId, playerId, role || 'member', 0, now]);
+}
+export async function leaveRoom(roomId, playerId) {
+  await runQ('DELETE FROM room_members WHERE room_id=? AND player_id=?',
+    'DELETE FROM room_members WHERE room_id=$1 AND player_id=$2', [roomId, playerId]);
+}
+export async function roomMembers(roomId) {
+  const rows = await getAll(
+    `SELECT m.player_id, m.role, m.muted_until, p.username FROM room_members m
+     JOIN players p ON p.id = m.player_id WHERE m.room_id=? ORDER BY m.joined_ts`,
+    `SELECT m.player_id, m.role, m.muted_until, p.username FROM room_members m
+     JOIN players p ON p.id = m.player_id WHERE m.room_id=$1 ORDER BY m.joined_ts`,
+    [roomId]);
+  return rows.map(r => ({ player_id: Number(r.player_id), username: r.username, role: r.role, muted_until: Number(r.muted_until) }));
+}
+export async function roomMemberRole(roomId, playerId) {
+  const r = await getOne('SELECT role, muted_until FROM room_members WHERE room_id=? AND player_id=?',
+    'SELECT role, muted_until FROM room_members WHERE room_id=$1 AND player_id=$2', [roomId, playerId]);
+  return r ? { role: r.role, muted_until: Number(r.muted_until) } : null;
+}
+export async function setRoomMuted(roomId, playerId, untilTs) {
+  await runQ('UPDATE room_members SET muted_until=? WHERE room_id=? AND player_id=?',
+    'UPDATE room_members SET muted_until=$1 WHERE room_id=$2 AND player_id=$3', [untilTs, roomId, playerId]);
+}
+export async function playerRooms(playerId) {
+  const rows = await getAll('SELECT room_id FROM room_members WHERE player_id=?',
+    'SELECT room_id FROM room_members WHERE player_id=$1', [playerId]);
+  return rows.map(r => Number(r.room_id));
 }
