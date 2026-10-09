@@ -6,7 +6,7 @@
 'use strict';
 
 const $ = (id) => document.getElementById(id);
-const SPEED = 0.0011; // degrees/sec (~120 m/s, gamey)
+const SPEED = 0.0013; // degrees/sec (~145 m/s, gamey)
 let speedMult = 1;
 
 let CFG = { mapsKey: '', spawn: { lat: 6.3345, lng: 5.6040 }, bounds: null };
@@ -363,24 +363,46 @@ class GoogleRenderer {
 }
 
 class CanvasRenderer {
+  // Stylized Benin City: procedural road network, buildings, river, parks.
+  // World units = meters relative to (6.34, 5.61). Camera: center + px/m.
   init() {
     $('map').classList.remove('hidden');
-    $('map-fallback-note').classList.remove('hidden');
+    $('btn-recenter').classList.remove('hidden');
     this.canvas = $('map');
     this.ctx = this.canvas.getContext('2d');
     this.tapCb = null;
-    this.canvas.addEventListener('pointerdown', (e) => {
-      const r = this.canvas.getBoundingClientRect();
-      const x = e.clientX - r.left, y = e.clientY - r.top;
-      for (const p of players.values()) {
-        const pp = this.ll2px(p.lat, p.lng, r.width, r.height);
-        if (Math.hypot(pp.x - x, pp.y - y) < 26) { openProfile(p.id); return; }
-      }
-      const ll = this.px2ll(x, y, r.width, r.height);
-      if (this.tapCb) this.tapCb(ll.lat, ll.lng);
-    });
+    this.cam = { x: 0, y: 0, z: 0.02 };
+    this.follow = true;
+    this.pointers = new Map();
+    this.pinchD0 = 0; this.pinchZ0 = 0;
+    this.buildCity();
+    this.bindInput();
     this.fit();
+    const s = this.ll2m(CFG.spawn.lat, CFG.spawn.lng);
+    this.cam.x = s.x; this.cam.y = s.y;
+    this.cam.z = this.baseZoom();
     window.addEventListener('resize', () => this.fit());
+    this.addZoomButtons();
+  }
+  // ---- geo ----
+  ll2m(lat, lng) {
+    return {
+      x: (lng - 5.61) * 111320 * Math.cos(6.34 * Math.PI / 180),
+      y: -(lat - 6.34) * 110540,
+    };
+  }
+  m2ll(x, y) {
+    return {
+      lat: 6.34 - y / 110540,
+      lng: 5.61 + x / (111320 * Math.cos(6.34 * Math.PI / 180)),
+    };
+  }
+  w2s(x, y, w, h) {
+    return { x: (x - this.cam.x) * this.cam.z + w / 2, y: (y - this.cam.y) * this.cam.z + h / 2 };
+  }
+  baseZoom() {
+    const r = this.canvas.getBoundingClientRect();
+    return Math.min(r.width, r.height) / 11000;
   }
   fit() {
     const r = this.canvas.getBoundingClientRect();
@@ -388,69 +410,346 @@ class CanvasRenderer {
     this.canvas.width = Math.max(1, r.width * dpr);
     this.canvas.height = Math.max(1, r.height * dpr);
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const z0 = this.baseZoom();
+    this._bz = z0;
+    this.cam.z = Math.max(z0 * 0.5, Math.min(z0 * 7, this.cam.z || z0));
   }
-  scaleFor(w, h) { return Math.min(w, h) / 9000; } // ~9km view
-  ll2px(lat, lng, w, h) {
-    const s = this.scaleFor(w, h);
-    const cx = me ? me.lng : 5.61, cy = me ? me.lat : 6.34;
-    const mpx = 111320 * Math.cos(6.34 * Math.PI / 180) * s;
-    const mpy = 110540 * s;
-    return { x: w / 2 + (lng - cx) * mpx, y: h / 2 - (lat - cy) * mpy, s };
+  setZoom(nz, e) {
+    const z0 = this.baseZoom();
+    nz = Math.max(z0 * 0.5, Math.min(z0 * 7, nz));
+    if (e && e.clientX !== undefined) {
+      const r = this.canvas.getBoundingClientRect();
+      const sx = e.clientX - r.left, sy = e.clientY - r.top;
+      const wx = this.cam.x + (sx - r.width / 2) / this.cam.z;
+      const wy = this.cam.y + (sy - r.height / 2) / this.cam.z;
+      this.cam.z = nz;
+      this.cam.x = wx - (sx - r.width / 2) / nz;
+      this.cam.y = wy - (sy - r.height / 2) / nz;
+    } else this.cam.z = nz;
   }
-  px2ll(x, y, w, h) {
-    const s = this.scaleFor(w, h);
-    const cx = me ? me.lng : 5.61, cy = me ? me.lat : 6.34;
-    const mpx = 111320 * Math.cos(6.34 * Math.PI / 180) * s;
-    const mpy = 110540 * s;
-    return { lat: cy - (y - h / 2) / mpy, lng: cx + (x - w / 2) / mpx };
+  // ---- city generation (deterministic) ----
+  buildCity() {
+    let seed = 987654321;
+    const rnd = () => {
+      seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const ZM = {};
+    for (const [k, z] of Object.entries(ZONES)) ZM[k] = { ...this.ll2m(z.lat, z.lng), r: z.r };
+    this.ZM = ZM;
+    // Ikpoba river (east side), meandering north-south
+    this.river = [];
+    for (let i = 0; i <= 40; i++) {
+      const y = -6500 + (13000 * i) / 40;
+      const x = 4300 + Math.sin(i * 0.55) * 700 + Math.sin(i * 0.21) * 300;
+      this.river.push([x, y]);
+    }
+    this.parks = [
+      { x: -2700, y: -1900, r: 560 }, { x: 2900, y: 2500, r: 440 }, { x: -900, y: 3500, r: 400 },
+    ];
+    // roads: ring + radials + connectors
+    this.roads = [];
+    const ringC = ZM.ring;
+    const ringPts = [];
+    for (let i = 0; i <= 64; i++) {
+      const a = (i / 64) * Math.PI * 2;
+      ringPts.push([ringC.x + Math.cos(a) * 980, ringC.y + Math.sin(a) * 880]);
+    }
+    this.roads.push({ pts: ringPts, w: 52, c: '#42536d', dash: true });
+    const bez = (p0, p1, p2, n) => {
+      const pts = [];
+      for (let i = 0; i <= n; i++) {
+        const t = i / n, u = 1 - t;
+        pts.push([u * u * p0[0] + 2 * u * t * p1[0] + t * t * p2[0], u * u * p0[1] + 2 * u * t * p1[1] + t * t * p2[1]]);
+      }
+      return pts;
+    };
+    for (const k of ['oba', 'newbenin', 'uniben', 'zoo', 'kada', 'housing']) {
+      const z = ZM[k];
+      const ang = Math.atan2(z.y - ringC.y, z.x - ringC.x);
+      const p0 = [ringC.x + Math.cos(ang) * 980, ringC.y + Math.sin(ang) * 880];
+      const mid = [(p0[0] + z.x) / 2, (p0[1] + z.y) / 2];
+      const dx = z.x - p0[0], dy = z.y - p0[1], len = Math.hypot(dx, dy) || 1;
+      const off = 260 + rnd() * 200;
+      const p1 = [mid[0] - dy / len * off, mid[1] + dx / len * off];
+      this.roads.push({ pts: bez(p0, p1, [z.x, z.y], 26), w: 34, c: '#3a4a61', dash: true });
+    }
+    const link = (a, b) => {
+      const A = ZM[a], B = ZM[b];
+      const mid = [(A.x + B.x) / 2 + (rnd() - 0.5) * 500, (A.y + B.y) / 2 + (rnd() - 0.5) * 500];
+      this.roads.push({ pts: bez([A.x, A.y], mid, [B.x, B.y], 18), w: 22, c: '#2e3c52', dash: false });
+    };
+    link('oba', 'newbenin'); link('zoo', 'kada'); link('housing', 'ring'); link('newbenin', 'uniben');
+    // flattened segments for distance checks, in a spatial grid (fast lookups)
+    const cell = 400;
+    const grid = new Map();
+    const gkey = (cx, cy) => cx + ',' + cy;
+    const addSeg = (s, m) => {
+      const x0 = Math.min(s[0], s[2]) - m, x1 = Math.max(s[0], s[2]) + m;
+      const y0 = Math.min(s[1], s[3]) - m, y1 = Math.max(s[1], s[3]) + m;
+      for (let cx = Math.floor(x0 / cell); cx <= Math.floor(x1 / cell); cx++)
+        for (let cy = Math.floor(y0 / cell); cy <= Math.floor(y1 / cell); cy++) {
+          const k = gkey(cx, cy);
+          if (!grid.has(k)) grid.set(k, []);
+          grid.get(k).push({ s, m });
+        }
+    };
+    for (const r of this.roads)
+      for (let i = 0; i < r.pts.length - 1; i++)
+        addSeg([r.pts[i][0], r.pts[i][1], r.pts[i + 1][0], r.pts[i + 1][1]], 60);
+    for (let i = 0; i < this.river.length - 1; i++)
+      addSeg([this.river[i][0], this.river[i][1], this.river[i + 1][0], this.river[i + 1][1]], 210);
+    const distSeg = (px, py, s) => {
+      const dx = s[2] - s[0], dy = s[3] - s[1];
+      const l2 = dx * dx + dy * dy || 1;
+      let t = ((px - s[0]) * dx + (py - s[1]) * dy) / l2;
+      t = Math.max(0, Math.min(1, t));
+      return Math.hypot(px - (s[0] + t * dx), py - (s[1] + t * dy));
+    };
+    const blocked = (x, y) => {
+      const k = gkey(Math.floor(x / cell), Math.floor(y / cell));
+      const arr = grid.get(k);
+      if (!arr) return false;
+      for (const { s, m } of arr) if (distSeg(x, y, s) < m) return true;
+      return false;
+    };
+    // buildings
+    this.buildings = [];
+    for (let gx = -6500; gx <= 6500; gx += 150) {
+      for (let gy = -6500; gy <= 6500; gy += 150) {
+        if (rnd() < 0.38) continue;
+        const x = gx + (rnd() - 0.5) * 110, y = gy + (rnd() - 0.5) * 110;
+        if (blocked(x, y)) continue;
+        if (this.parks.some(p => Math.hypot(x - p.x, y - p.y) < p.r + 70)) continue;
+        if (Object.values(ZM).some(z => Math.hypot(x - z.x, y - z.y) < z.r + 130)) continue;
+        const w = 45 + rnd() * 70, h = 45 + rnd() * 70;
+        const sh = 22 + rnd() * 16;
+        const warm = rnd() < 0.18;
+        this.buildings.push({
+          x: x - w / 2, y: y - h / 2, w, h,
+          c: warm ? `rgb(${sh + 14},${sh + 4},${sh - 2})` : `rgb(${sh},${sh + 7},${sh + 14})`,
+        });
+      }
+    }
+  }
+  // ---- input: tap = move, drag = pan, pinch/wheel = zoom ----
+  bindInput() {
+    const c = this.canvas;
+    c.style.touchAction = 'none';
+    c.addEventListener('pointerdown', (e) => {
+      try { c.setPointerCapture(e.pointerId); } catch {}
+      this.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, t: Date.now(), moved: false });
+      if (this.pointers.size === 2) {
+        this.multiTouch = true;
+        const p = [...this.pointers.values()];
+        this.pinchD0 = Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
+        this.pinchZ0 = this.cam.z;
+      }
+    });
+    c.addEventListener('pointermove', (e) => {
+      const pt = this.pointers.get(e.pointerId);
+      if (!pt) return;
+      const dx = e.clientX - pt.x, dy = e.clientY - pt.y;
+      pt.x = e.clientX; pt.y = e.clientY;
+      if (Math.hypot(e.clientX - pt.sx, e.clientY - pt.sy) > 12) pt.moved = true;
+      if (this.pointers.size === 1) {
+        if (pt.moved) {
+          this.follow = false;
+          this.cam.x -= dx / this.cam.z;
+          this.cam.y -= dy / this.cam.z;
+        }
+      } else if (this.pointers.size === 2) {
+        const p = [...this.pointers.values()];
+        const d = Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
+        if (this.pinchD0 > 0) this.setZoom(this.pinchZ0 * d / this.pinchD0);
+        this.follow = false;
+      }
+    });
+    const up = (e) => {
+      const pt = this.pointers.get(e.pointerId);
+      this.pointers.delete(e.pointerId);
+      const wasPinch = this.multiTouch;
+      if (this.pointers.size === 0) this.multiTouch = false;
+      if (pt && this.pointers.size === 0 && !pt.moved && !wasPinch && Date.now() - pt.t < 500) this.handleTap(e);
+    };
+    c.addEventListener('pointerup', up);
+    c.addEventListener('pointercancel', (e) => this.pointers.delete(e.pointerId));
+    c.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      this.setZoom(this.cam.z * Math.pow(1.0016, -e.deltaY), e);
+      this.follow = false;
+    }, { passive: false });
+  }
+  handleTap(e) {
+    const r = this.canvas.getBoundingClientRect();
+    const x = e.clientX - r.left, y = e.clientY - r.top;
+    for (const p of players.values()) {
+      const m = this.ll2m(p.lat, p.lng);
+      const s = this.w2s(m.x, m.y, r.width, r.height);
+      if (Math.hypot(s.x - x, s.y - y) < 30) { openProfile(p.id); return; }
+    }
+    const wx = this.cam.x + (x - r.width / 2) / this.cam.z;
+    const wy = this.cam.y + (y - r.height / 2) / this.cam.z;
+    const ll = this.m2ll(wx, wy);
+    ll.lat = clamp(ll.lat, BOUNDS.latMin, BOUNDS.latMax);
+    ll.lng = clamp(ll.lng, BOUNDS.lngMin, BOUNDS.lngMax);
+    if (this.tapCb) this.tapCb(ll.lat, ll.lng);
+  }
+  addZoomButtons() {
+    let el = $('map-zoom');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'map-zoom';
+      el.innerHTML = '<button aria-label="Zoom in">+</button><button aria-label="Zoom out">−</button>';
+      $('map-wrap').appendChild(el);
+      el.children[0].onclick = () => this.setZoom(this.cam.z * 1.4);
+      el.children[1].onclick = () => this.setZoom(this.cam.z / 1.4);
+    }
+    el.classList.remove('hidden');
   }
   playerIn() {} playerOut() {}
+  // ---- draw ----
+  rr(x, y, w, h, r) {
+    const ctx = this.ctx;
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(x, y, w, h, r);
+    else ctx.rect(x, y, w, h);
+  }
+  pill(x, y, text, font, fg, bg) {
+    const ctx = this.ctx;
+    ctx.font = font;
+    const tw = ctx.measureText(text).width;
+    const pad = 9, ph = 24;
+    this.rr(x - tw / 2 - pad, y - ph / 2, tw + pad * 2, ph, 12);
+    ctx.fillStyle = bg; ctx.fill();
+    ctx.fillStyle = fg; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(text, x, y + 1);
+    ctx.textBaseline = 'alphabetic';
+  }
   frame() {
     const ctx = this.ctx, c = this.canvas;
     const r = c.getBoundingClientRect(), w = r.width, h = r.height;
-    ctx.clearRect(0, 0, w, h);
-    ctx.fillStyle = '#0e1622'; ctx.fillRect(0, 0, w, h);
-    const P = (lat, lng) => this.ll2px(lat, lng, w, h);
-    // roads between zones
-    ctx.strokeStyle = '#2c3a50'; ctx.lineWidth = 5; ctx.lineCap = 'round';
-    const zs = Object.values(ZONES);
-    for (let i = 0; i < zs.length; i++) for (let j = i + 1; j < zs.length; j++) {
-      const a = P(zs[i].lat, zs[i].lng), b = P(zs[j].lat, zs[j].lng);
-      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    if (me && this.follow) {
+      const m = this.ll2m(me.lat, me.lng);
+      this.cam.x += (m.x - this.cam.x) * 0.14;
+      this.cam.y += (m.y - this.cam.y) * 0.14;
+    }
+    const z = this.cam.z;
+    const S = (x, y) => this.w2s(x, y, w, h);
+    // background
+    const g = ctx.createLinearGradient(0, 0, 0, h);
+    g.addColorStop(0, '#0d1622'); g.addColorStop(1, '#090f17');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, w, h);
+    const x0 = this.cam.x - w / 2 / z, x1 = this.cam.x + w / 2 / z;
+    const y0 = this.cam.y - h / 2 / z, y1 = this.cam.y + h / 2 / z;
+    const vis = (x, y, m) => x > x0 - m && x < x1 + m && y > y0 - m && y < y1 + m;
+    // river
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.strokeStyle = '#0d2839'; ctx.lineWidth = 300 * z;
+    ctx.beginPath();
+    this.river.forEach(([x, y], i) => { const s = S(x, y); i ? ctx.lineTo(s.x, s.y) : ctx.moveTo(s.x, s.y); });
+    ctx.stroke();
+    ctx.strokeStyle = '#123449'; ctx.lineWidth = 230 * z;
+    ctx.stroke();
+    // parks
+    for (const p of this.parks) {
+      if (!vis(p.x, p.y, p.r)) continue;
+      const s = S(p.x, p.y);
+      ctx.fillStyle = '#122b1a';
+      ctx.beginPath(); ctx.arc(s.x, s.y, p.r * z, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#163722';
+      ctx.beginPath(); ctx.arc(s.x, s.y, p.r * 0.72 * z, 0, Math.PI * 2); ctx.fill();
+    }
+    // buildings
+    for (const b of this.buildings) {
+      if (b.x > x1 || b.x + b.w < x0 || b.y > y1 || b.y + b.h < y0) continue;
+      const s = S(b.x, b.y);
+      ctx.fillStyle = b.c;
+      ctx.fillRect(s.x, s.y, Math.max(1.5, b.w * z), Math.max(1.5, b.h * z));
+    }
+    // roads
+    for (const rd of this.roads) {
+      ctx.strokeStyle = rd.c; ctx.lineWidth = Math.max(2, rd.w * z);
+      ctx.beginPath();
+      rd.pts.forEach(([x, y], i) => { const s = S(x, y); i ? ctx.lineTo(s.x, s.y) : ctx.moveTo(s.x, s.y); });
+      ctx.stroke();
+      if (rd.dash && z > 0.008) {
+        ctx.strokeStyle = 'rgba(214,178,74,0.5)'; ctx.lineWidth = Math.max(1, 3 * z * 10);
+        ctx.setLineDash([16 * z * 10, 22 * z * 10]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
     }
     // zones
-    for (const z of zs) {
-      const p = P(z.lat, z.lng), rr = z.r * p.s;
-      ctx.fillStyle = z.color + '55'; ctx.strokeStyle = z.color; ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.arc(p.x, p.y, rr, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
-      ctx.font = '20px sans-serif'; ctx.textAlign = 'center';
-      ctx.fillText(z.icon, p.x, p.y - 6);
-      ctx.font = '700 12px sans-serif'; ctx.fillStyle = '#eef4fa';
-      ctx.fillText(z.name, p.x, p.y + 16);
+    const t = performance.now() / 1000;
+    for (const [k, zv] of Object.entries(ZONES)) {
+      const zm = this.ZM[k];
+      if (!vis(zm.x, zm.y, zv.r)) continue;
+      const s = S(zm.x, zm.y), rad = zv.r * z;
+      const glow = ctx.createRadialGradient(s.x, s.y, rad * 0.2, s.x, s.y, rad);
+      glow.addColorStop(0, zv.color + 'aa'); glow.addColorStop(1, zv.color + '11');
+      ctx.fillStyle = glow;
+      ctx.beginPath(); ctx.arc(s.x, s.y, rad, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = zv.color; ctx.lineWidth = 2;
+      ctx.setLineDash([10, 8]); ctx.lineDashOffset = -t * 12;
+      ctx.beginPath(); ctx.arc(s.x, s.y, rad, 0, Math.PI * 2); ctx.stroke();
+      ctx.setLineDash([]);
+      const fs = Math.max(15, Math.min(26, 20 * Math.sqrt(z / (this._bz || z))));
+      ctx.font = `${fs}px sans-serif`; ctx.textAlign = 'center';
+      ctx.fillText(zv.icon, s.x, s.y - 4);
+      if (z > (this._bz || z) * 0.55)
+        this.pill(s.x, s.y + 22, zv.name, '700 12px sans-serif', '#eef4fa', 'rgba(10,15,22,0.85)');
+    }
+    // route to destination
+    if (me && clickTarget) {
+      const a = this.ll2m(me.lat, me.lng), b = this.ll2m(clickTarget.lat, clickTarget.lng);
+      const sa = S(a.x, a.y), sb = S(b.x, b.y);
+      ctx.strokeStyle = 'rgba(34,197,94,0.75)'; ctx.lineWidth = 3;
+      ctx.setLineDash([8, 8]); ctx.lineDashOffset = -t * 30;
+      ctx.beginPath(); ctx.moveTo(sa.x, sa.y); ctx.lineTo(sb.x, sb.y); ctx.stroke();
+      ctx.setLineDash([]);
+      const pulse = 1 + Math.sin(t * 5) * 0.15;
+      ctx.font = `${20 * pulse}px sans-serif`; ctx.textAlign = 'center';
+      ctx.fillText('🚩', sb.x, sb.y - 8);
     }
     // players
-    const dot = (lat, lng, color, label, isMe, gov) => {
-      const p = P(lat, lng);
+    const dot = (lat, lng, color, label, isMe, gov, detained) => {
+      const m = this.ll2m(lat, lng), p = S(m.x, m.y);
+      if (isMe) {
+        const pr = (14 + ((t * 22) % 26));
+        ctx.strokeStyle = `rgba(34,197,94,${Math.max(0, 0.5 - pr / 60)})`;
+        ctx.lineWidth = 2.5;
+        ctx.beginPath(); ctx.arc(p.x, p.y, pr, 0, Math.PI * 2); ctx.stroke();
+      }
       ctx.beginPath(); ctx.arc(p.x, p.y, isMe ? 11 : 9, 0, Math.PI * 2);
-      ctx.fillStyle = color; ctx.fill();
+      ctx.fillStyle = color;
+      ctx.shadowColor = color; ctx.shadowBlur = 12;
+      ctx.fill();
+      ctx.shadowBlur = 0;
       if (isMe) { ctx.strokeStyle = '#fff'; ctx.lineWidth = 2.5; ctx.stroke(); }
-      ctx.font = '600 11px sans-serif'; ctx.textAlign = 'center';
-      ctx.fillStyle = isMe ? '#22c55e' : '#eef4fa';
-      ctx.fillText(label, p.x, p.y - 16);
-      if (gov) { ctx.font = '15px sans-serif'; ctx.fillText('👑', p.x, p.y - 30); }
+      this.pill(p.x, p.y - 24, label, '600 11px sans-serif', isMe ? '#22c55e' : '#eef4fa', 'rgba(10,15,22,0.8)');
+      if (gov) { ctx.font = '15px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('👑', p.x, p.y - 44); }
+      if (detained) { ctx.font = '15px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('⛓️', p.x + 16, p.y - 40); }
     };
-    for (const p of players.values()) dot(p.lat, p.lng, colorFor(p.id), p.name, false, p.gov);
-    if (me) dot(me.lat, me.lng, colorFor(me.id), me.name + ' (you)', true, me.gov);
+    for (const p of players.values()) dot(p.lat, p.lng, colorFor(p.id), p.name, false, p.gov, false);
+    if (me) dot(me.lat, me.lng, colorFor(me.id), me.name, true, me.gov, false);
+    // vignette
+    const v = ctx.createRadialGradient(w / 2, h / 2, Math.min(w, h) * 0.42, w / 2, h / 2, Math.max(w, h) * 0.75);
+    v.addColorStop(0, 'rgba(0,0,0,0)'); v.addColorStop(1, 'rgba(0,0,0,0.42)');
+    ctx.fillStyle = v; ctx.fillRect(0, 0, w, h);
   }
   project(lat, lng) {
     const r = this.canvas.getBoundingClientRect();
-    const p = this.ll2px(lat, lng, r.width, r.height);
+    const m = this.ll2m(lat, lng);
+    const p = this.w2s(m.x, m.y, r.width, r.height);
     const wrap = $('map-wrap').getBoundingClientRect();
     const cr = this.canvas.getBoundingClientRect();
     return { x: p.x + (cr.left - wrap.left), y: p.y + (cr.top - wrap.top) };
   }
   onTap(cb) { this.tapCb = cb; }
-  recenter() {}
+  recenter() { this.follow = true; }
 }
 
 async function initRenderer() {
